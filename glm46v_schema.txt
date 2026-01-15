@@ -1,0 +1,66 @@
+Glm4vForConditionalGeneration(
+  (model): Glm4vModel(
+    (visual): Glm4vVisionModel(
+      (embeddings): Glm4vVisionEmbeddings(
+        (position_embedding): Embedding(576, 1536)
+      )
+      (patch_embed): Glm4vVisionPatchEmbed(
+        (proj): Conv3d(3, 1536, kernel_size=(2, 14, 14), stride=(2, 14, 14))
+      )
+      (rotary_pos_emb): Glm4vVisionRotaryEmbedding()
+      (blocks): ModuleList(
+        (0-23): 24 x Glm4vVisionBlock(
+          (norm1): Glm4vRMSNorm((1536,), eps=1e-05)
+          (norm2): Glm4vRMSNorm((1536,), eps=1e-05)
+          (attn): Glm4vVisionAttention(
+            (qkv): Linear(in_features=1536, out_features=4608, bias=False)
+            (proj): Linear(in_features=1536, out_features=1536, bias=False)
+          )
+          (mlp): Glm4VisionMlp(
+            (gate_proj): Linear(in_features=1536, out_features=4096, bias=False)
+            (up_proj): Linear(in_features=1536, out_features=4096, bias=False)
+            (down_proj): Linear(in_features=4096, out_features=1536, bias=False)
+            (act_fn): SiLUActivation()
+          )
+        )
+      )
+      (merger): Glm4vVisionPatchMerger(
+        (proj): Linear(in_features=4096, out_features=4096, bias=False)
+        (post_projection_norm): LayerNorm((4096,), eps=1e-05, elementwise_affine=True)
+        (gate_proj): Linear(in_features=4096, out_features=13696, bias=False)
+        (up_proj): Linear(in_features=4096, out_features=13696, bias=False)
+        (down_proj): Linear(in_features=13696, out_features=4096, bias=False)
+        (act1): GELU(approximate='none')
+        (act_fn): SiLUActivation()
+      )
+      (post_conv_layernorm): Glm4vRMSNorm((1536,), eps=1e-05)
+      (downsample): Conv2d(1536, 4096, kernel_size=(2, 2), stride=(2, 2))
+      (post_layernorm): Glm4vRMSNorm((1536,), eps=1e-05)
+    )
+    (language_model): Glm4vTextModel(
+      (embed_tokens): Embedding(151552, 4096, padding_idx=151329)
+      (layers): ModuleList(
+        (0-39): 40 x Glm4vTextDecoderLayer(
+          (self_attn): Glm4vTextAttention(
+            (q_proj): Linear(in_features=4096, out_features=4096, bias=True)
+            (k_proj): Linear(in_features=4096, out_features=256, bias=True)
+            (v_proj): Linear(in_features=4096, out_features=256, bias=True)
+            (o_proj): Linear(in_features=4096, out_features=4096, bias=False)
+          )
+          (mlp): Glm4vTextMLP(
+            (gate_up_proj): Linear(in_features=4096, out_features=27392, bias=False)
+            (down_proj): Linear(in_features=13696, out_features=4096, bias=False)
+            (activation_fn): SiLUActivation()
+          )
+          (input_layernorm): Glm4vRMSNorm((4096,), eps=1e-05)
+          (post_attention_layernorm): Glm4vRMSNorm((4096,), eps=1e-05)
+          (post_self_attn_layernorm): Glm4vRMSNorm((4096,), eps=1e-05)
+          (post_mlp_layernorm): Glm4vRMSNorm((4096,), eps=1e-05)
+        )
+      )
+      (norm): Glm4vRMSNorm((4096,), eps=1e-05)
+      (rotary_emb): Glm4vTextRotaryEmbedding()
+    )
+  )
+  (lm_head): Linear(in_features=4096, out_features=151552, bias=False)
+)
