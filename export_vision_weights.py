@@ -417,6 +417,115 @@ def export_text_weights_raw(model, output_dir: str):
     print(f"\nTotal text weights: {total_bytes / 1024 / 1024:.1f} MB")
 
 
+def export_int8_text_weights(model, output_dir: str):
+    """Export INT8 quantized text model weights.
+
+    Uses symmetric per-channel quantization for linear layers.
+    Embeddings and layer norms stay in FP16.
+    """
+    weights_path = os.path.join(output_dir, "text_model_int8.bin")
+    print(f"\nSaving INT8 quantized text weights to {weights_path}...")
+
+    text = model.model.language_model
+    lm_head = model.lm_head
+    total_bytes = 0
+
+    def quantize_per_channel(tensor):
+        """Symmetric per-channel INT8 quantization.
+
+        For weight [in, out], quantize per output channel.
+        Returns (int8_weights, fp16_scales)
+        """
+        # Per-channel (output dim) max absolute value
+        abs_max = tensor.abs().max(dim=0, keepdim=True).values.clamp(min=1e-8)
+        scale = abs_max / 127.0  # Scale to int8 range [-127, 127]
+        quantized = (tensor / scale).round().clamp(-127, 127).to(torch.int8)
+        return quantized, scale.squeeze(0).half()
+
+    with open(weights_path, 'wb') as f:
+        def write_fp16(name, tensor):
+            nonlocal total_bytes
+            arr = tensor.detach().numpy().astype(np.float16)
+            arr.tofile(f)
+            total_bytes += arr.nbytes
+            print(f"  {name}: {list(arr.shape)} (fp16)")
+
+        def write_int8(name, tensor):
+            nonlocal total_bytes
+            arr = tensor.detach().numpy().astype(np.int8)
+            arr.tofile(f)
+            total_bytes += arr.nbytes
+            print(f"  {name}: {list(arr.shape)} (int8)")
+
+        def write_quant_linear(name, weight, has_bias, bias=None):
+            """Write quantized linear layer: INT8 weights + FP16 scales + optional FP16 bias"""
+            nonlocal total_bytes
+            # Transpose to [in, out] for MLX
+            w_t = weight.T.contiguous()
+            qw, scales = quantize_per_channel(w_t)
+
+            # Write INT8 weights
+            arr = qw.numpy().astype(np.int8)
+            arr.tofile(f)
+            total_bytes += arr.nbytes
+
+            # Write FP16 scales
+            sarr = scales.numpy().astype(np.float16)
+            sarr.tofile(f)
+            total_bytes += sarr.nbytes
+
+            print(f"  {name}: weight {list(arr.shape)} (int8), scales {list(sarr.shape)} (fp16)")
+
+            # Write FP16 bias if present
+            if has_bias and bias is not None:
+                barr = bias.detach().numpy().astype(np.float16)
+                barr.tofile(f)
+                total_bytes += barr.nbytes
+                print(f"  {name}: bias {list(barr.shape)} (fp16)")
+            elif has_bias:
+                # Write zeros if no bias
+                barr = np.zeros(weight.shape[0], dtype=np.float16)
+                barr.tofile(f)
+                total_bytes += barr.nbytes
+                print(f"  {name}: bias {list(barr.shape)} (zeros, fp16)")
+
+        # 1. Embedding table [vocab_size, dim] - keep in FP16
+        write_fp16("embed_tokens", text.embed_tokens.weight.data)
+
+        # 2. Transformer layers
+        for i, layer in enumerate(text.layers):
+            p = f"layers.{i}."
+
+            # Layer norms stay in FP16
+            write_fp16(f"{p}input_layernorm", layer.input_layernorm.weight.data)
+            write_fp16(f"{p}post_self_attn_layernorm", layer.post_self_attn_layernorm.weight.data)
+            write_fp16(f"{p}post_attention_layernorm", layer.post_attention_layernorm.weight.data)
+            write_fp16(f"{p}post_mlp_layernorm", layer.post_mlp_layernorm.weight.data)
+
+            # Attention - INT8 quantized
+            attn = layer.self_attn
+            write_quant_linear(f"{p}q_proj", attn.q_proj.weight.data, True, attn.q_proj.bias)
+            write_quant_linear(f"{p}k_proj", attn.k_proj.weight.data, True, attn.k_proj.bias)
+            write_quant_linear(f"{p}v_proj", attn.v_proj.weight.data, True, attn.v_proj.bias)
+            write_quant_linear(f"{p}o_proj", attn.o_proj.weight.data, False)
+
+            # MLP - INT8 quantized
+            mlp = layer.mlp
+            write_quant_linear(f"{p}gate_up_proj", mlp.gate_up_proj.weight.data, False)
+            write_quant_linear(f"{p}down_proj", mlp.down_proj.weight.data, False)
+
+        # 3. Final norm - FP16
+        write_fp16("norm.weight", text.norm.weight.data)
+
+        # 4. LM head - INT8 quantized
+        write_quant_linear("lm_head", lm_head.weight.data, False)
+
+    print(f"\nTotal INT8 quantized text weights: {total_bytes / 1024 / 1024:.1f} MB")
+    fp16_size = 17929.6  # MB from FP16 export
+    compression = fp16_size / (total_bytes / 1024 / 1024)
+    print(f"Compression ratio vs FP16: {compression:.2f}x")
+
+
 def main():
     global MODEL_PATH
 
@@ -424,11 +533,12 @@ def main():
     parser.add_argument("--model", default=MODEL_PATH, help="Model path")
     parser.add_argument("--output", default="/Users/Stephen/Documents/mlx_models/glm/vision_weights", help="Output directory")
     parser.add_argument("--vision", action="store_true", help="Export vision encoder weights")
-    parser.add_argument("--text", action="store_true", help="Export text model weights")
+    parser.add_argument("--text", action="store_true", help="Export text model weights (FP16)")
+    parser.add_argument("--text-int8", action="store_true", help="Export text model weights (INT8 quantized)")
     args = parser.parse_args()
 
-    # Default to vision if neither specified
-    if not args.vision and not args.text:
+    # Default to vision if nothing specified
+    if not args.vision and not args.text and not args.text_int8:
         args.vision = True
 
     MODEL_PATH = args.model
@@ -445,6 +555,10 @@ def main():
             export_text_weights_raw(model, output_dir)
             create_text_test_data(model, output_dir)
             print(f"\nText weights exported to: {output_dir}/text_model.bin")
+
+        if args.text_int8:
+            export_int8_text_weights(model, output_dir)
+            print(f"\nINT8 text weights exported to: {output_dir}/text_model_int8.bin")
 
     except Exception as e:
         import traceback

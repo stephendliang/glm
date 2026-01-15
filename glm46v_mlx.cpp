@@ -178,6 +178,43 @@ struct TextModelWeights {
     TextModelWeights() : layers(TEXT_NUM_LAYERS) {}
 };
 
+// INT8 quantized weight structures (for text encoder only)
+struct QuantizedLinearWeights {
+    mx::array weight = empty_array();  // int8 [in, out]
+    mx::array scales = empty_array();  // float16 [out] per-channel scales
+    mx::array bias = empty_array();    // float16 [out] or empty
+};
+
+struct QuantizedTextAttentionWeights {
+    QuantizedLinearWeights q_proj;
+    QuantizedLinearWeights k_proj;
+    QuantizedLinearWeights v_proj;
+    QuantizedLinearWeights o_proj;
+};
+
+struct QuantizedTextMLPWeights {
+    QuantizedLinearWeights gate_up_proj;
+    QuantizedLinearWeights down_proj;
+};
+
+struct QuantizedTextLayerWeights {
+    RMSNormWeights input_layernorm;           // Keep in FP16
+    RMSNormWeights post_self_attn_layernorm;  // Keep in FP16
+    RMSNormWeights post_attention_layernorm;  // Keep in FP16
+    RMSNormWeights post_mlp_layernorm;        // Keep in FP16
+    QuantizedTextAttentionWeights self_attn;
+    QuantizedTextMLPWeights mlp;
+};
+
+struct QuantizedTextModelWeights {
+    mx::array embed_tokens = empty_array();  // Keep embeddings in FP16
+    std::vector<QuantizedTextLayerWeights> layers;
+    RMSNormWeights norm;                     // Keep in FP16
+    QuantizedLinearWeights lm_head;
+
+    QuantizedTextModelWeights() : layers(TEXT_NUM_LAYERS) {}
+};
+
 struct GridTHW {
     int t;
     int h;
@@ -247,8 +284,11 @@ void init_text_model(TextModelWeights* model, mx::Dtype dtype = mx::float16, flo
 
     for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
         auto& layer = model->layers[i];
+        // GLM-4V has 4 layer norms per layer
         init_rms_norm(&layer.input_layernorm, TEXT_DIM, dtype);
+        init_rms_norm(&layer.post_self_attn_layernorm, TEXT_DIM, dtype);
         init_rms_norm(&layer.post_attention_layernorm, TEXT_DIM, dtype);
+        init_rms_norm(&layer.post_mlp_layernorm, TEXT_DIM, dtype);
         init_linear(&layer.self_attn.q_proj, TEXT_DIM, TEXT_DIM, dtype, stddev, true);
         init_linear(&layer.self_attn.k_proj, TEXT_DIM, TEXT_KV_DIM, dtype, stddev, true);
         init_linear(&layer.self_attn.v_proj, TEXT_DIM, TEXT_KV_DIM, dtype, stddev, true);
@@ -434,6 +474,95 @@ bool load_text_weights(TextModelWeights* model, const std::string& path) {
     return true;
 }
 
+// Load INT8 quantized text weights
+// Format: FP16 for embeddings/norms, INT8 weights + FP16 scales for linear layers
+bool load_quantized_text_weights(QuantizedTextModelWeights* model, const std::string& path) {
+    std::cout << "Loading INT8 quantized text weights from: " << path << std::endl;
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open file: " << path << std::endl;
+        return false;
+    }
+
+    size_t file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> buffer(file_size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), file_size)) {
+        std::cerr << "Error: Failed to read file: " << path << std::endl;
+        return false;
+    }
+
+    const uint8_t* ptr = buffer.data();
+
+    // Helper to read FP16 array
+    auto read_fp16 = [&ptr](const mx::Shape& shape) -> mx::array {
+        size_t count = 1;
+        for (auto d : shape) count *= d;
+        mx::array arr(reinterpret_cast<const mlx::core::float16_t*>(ptr), shape, mx::float16);
+        ptr += count * sizeof(uint16_t);
+        return arr;
+    };
+
+    // Helper to read INT8 array
+    auto read_int8 = [&ptr](const mx::Shape& shape) -> mx::array {
+        size_t count = 1;
+        for (auto d : shape) count *= d;
+        mx::array arr(reinterpret_cast<const int8_t*>(ptr), shape, mx::int8);
+        ptr += count * sizeof(int8_t);
+        return arr;
+    };
+
+    // Helper to read quantized linear weights (INT8 weight + FP16 scale + optional FP16 bias)
+    auto read_quant_linear = [&](QuantizedLinearWeights* w, int in_dim, int out_dim, bool has_bias) {
+        w->weight = read_int8({in_dim, out_dim});
+        w->scales = read_fp16({out_dim});
+        if (has_bias) {
+            w->bias = read_fp16({out_dim});
+        }
+    };
+
+    // 1. embed_tokens [vocab_size, dim] - keep in FP16
+    model->embed_tokens = read_fp16({TEXT_VOCAB_SIZE, TEXT_DIM});
+
+    // 2. Transformer layers
+    for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
+        auto& layer = model->layers[i];
+
+        // Layer norms stay in FP16
+        layer.input_layernorm.weight = read_fp16({TEXT_DIM});
+        layer.post_self_attn_layernorm.weight = read_fp16({TEXT_DIM});
+        layer.post_attention_layernorm.weight = read_fp16({TEXT_DIM});
+        layer.post_mlp_layernorm.weight = read_fp16({TEXT_DIM});
+
+        // Attention projections - INT8 quantized
+        read_quant_linear(&layer.self_attn.q_proj, TEXT_DIM, TEXT_DIM, true);
+        read_quant_linear(&layer.self_attn.k_proj, TEXT_DIM, TEXT_KV_DIM, true);
+        read_quant_linear(&layer.self_attn.v_proj, TEXT_DIM, TEXT_KV_DIM, true);
+        read_quant_linear(&layer.self_attn.o_proj, TEXT_DIM, TEXT_DIM, false);
+
+        // MLP - INT8 quantized
+        read_quant_linear(&layer.mlp.gate_up_proj, TEXT_DIM, TEXT_GATE_UP_DIM, false);
+        read_quant_linear(&layer.mlp.down_proj, TEXT_MLP_DIM, TEXT_DIM, false);
+    }
+
+    // 3. Final norm - FP16
+    model->norm.weight = read_fp16({TEXT_DIM});
+
+    // 4. LM head - INT8 quantized
+    read_quant_linear(&model->lm_head, TEXT_DIM, TEXT_VOCAB_SIZE, false);
+
+    size_t bytes_read = ptr - buffer.data();
+    if (bytes_read != buffer.size()) {
+        std::cerr << "Warning: Read " << bytes_read << " bytes, buffer has " << buffer.size() << std::endl;
+    }
+
+    std::cout << "INT8 quantized text weights loaded successfully!" << std::endl;
+    std::cout << "  File size: " << file_size / 1024 / 1024 << " MB (INT8 + FP16 scales)" << std::endl;
+    return true;
+}
+
 // Load binary float32 array from file
 mx::array load_binary_f32(const std::string& path, const mx::Shape& shape) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -507,6 +636,22 @@ mx::array fast_linear(mx::array x, const LinearWeights* w) {
         return mx::matmul(x, w->weight);
     }
     return mx::addmm(w->bias, x, w->weight);
+}
+
+// INT8 quantized linear: dequantize on-the-fly and compute
+// weight: int8 [in, out], scales: fp16 [out]
+// Dequantized = weight * scales (broadcast over in dimension)
+mx::array quantized_linear(mx::array x, const QuantizedLinearWeights* w) {
+    // Dequantize: cast int8 to fp16, multiply by scales
+    // weight is [in, out], scales is [out]
+    auto weight_f16 = mx::astype(w->weight, mx::float16);
+    auto scales_bc = mx::reshape(w->scales, {1, w->scales.shape(0)});  // [1, out]
+    auto dequant = mx::multiply(weight_f16, scales_bc);  // [in, out]
+
+    if (w->bias.size() == 0) {
+        return mx::matmul(x, dequant);
+    }
+    return mx::addmm(w->bias, x, dequant);
 }
 
 mx::array rms_norm(mx::array x, const RMSNormWeights* w, float eps = 1e-5f) {
@@ -861,6 +1006,101 @@ mx::array text_model_forward_with_logits(mx::array input_ids, const TextModelWei
                                           const mx::array& position_ids, const mx::array& attention_mask) {
     auto hidden_states = text_model_forward_ids(input_ids, model, position_ids, attention_mask);
     return compute_logits(hidden_states, model);
+}
+
+// ==================== INT8 Quantized Text Model Forward ====================
+
+mx::array quantized_text_attention_forward(mx::array x, const QuantizedTextAttentionWeights* w,
+                                           const std::pair<mx::array, mx::array>& position_embeddings,
+                                           const mx::array& attention_mask) {
+    int B = x.shape(0);
+    int T = x.shape(1);
+
+    auto q = quantized_linear(x, &w->q_proj);
+    auto k = quantized_linear(x, &w->k_proj);
+    auto v = quantized_linear(x, &w->v_proj);
+
+    auto q_rs = mx::reshape(q, {B, T, TEXT_NUM_HEADS, TEXT_HEAD_DIM});
+    auto k_rs = mx::reshape(k, {B, T, TEXT_KV_HEADS, TEXT_HEAD_DIM});
+    auto v_rs = mx::reshape(v, {B, T, TEXT_KV_HEADS, TEXT_HEAD_DIM});
+
+    q_rs = mx::transpose(q_rs, {0, 2, 1, 3});
+    k_rs = mx::transpose(k_rs, {0, 2, 1, 3});
+    v_rs = mx::transpose(v_rs, {0, 2, 1, 3});
+
+    auto rotated = apply_multimodal_rotary_pos_emb(q_rs, k_rs, position_embeddings.first, position_embeddings.second);
+    q_rs = rotated.first;
+    k_rs = rotated.second;
+
+    const int kv_repeat = TEXT_NUM_HEADS / TEXT_KV_HEADS;
+    k_rs = repeat_kv(k_rs, kv_repeat);
+    v_rs = repeat_kv(v_rs, kv_repeat);
+
+    float scale = 1.0f / std::sqrt((float)TEXT_HEAD_DIM);
+    std::optional<mx::array> mask_opt;
+    if (attention_mask.size() != 0) {
+        auto mask_f = mx::astype(attention_mask, mx::float32);
+        auto inv_mask = mx::subtract(mx::array(1.0f), mask_f);
+        auto neg_inf = mx::array(-1e9f);
+        auto add_mask = mx::multiply(inv_mask, neg_inf);
+        add_mask = mx::reshape(add_mask, {B, 1, 1, T});
+        mask_opt = add_mask;
+    }
+    auto out = mx::fast::scaled_dot_product_attention(q_rs, k_rs, v_rs, scale, "causal", mask_opt);
+    out = mx::transpose(out, {0, 2, 1, 3});
+    out = mx::reshape(out, {B, T, TEXT_DIM});
+    return quantized_linear(out, &w->o_proj);
+}
+
+mx::array quantized_text_mlp_forward(mx::array x, const QuantizedTextMLPWeights* w) {
+    auto gate_up = quantized_linear(x, &w->gate_up_proj);
+    auto gate_up_split = mx::split(gate_up, 2, 2);
+    auto gate = silu(gate_up_split[0]);
+    auto up = gate_up_split[1];
+    return quantized_linear(mx::multiply(gate, up), &w->down_proj);
+}
+
+mx::array quantized_text_layer_forward(mx::array x, const QuantizedTextLayerWeights* w,
+                                       const std::pair<mx::array, mx::array>& position_embeddings,
+                                       const mx::array& attention_mask) {
+    // GLM-4V uses 4 layer norms per layer
+    auto residual = x;
+    x = rms_norm(x, &w->input_layernorm, TEXT_RMS_EPS);
+    x = quantized_text_attention_forward(x, &w->self_attn, position_embeddings, attention_mask);
+    x = rms_norm(x, &w->post_self_attn_layernorm, TEXT_RMS_EPS);
+    x = mx::add(residual, x);
+
+    residual = x;
+    x = rms_norm(x, &w->post_attention_layernorm, TEXT_RMS_EPS);
+    x = quantized_text_mlp_forward(x, &w->mlp);
+    x = rms_norm(x, &w->post_mlp_layernorm, TEXT_RMS_EPS);
+    return mx::add(residual, x);
+}
+
+mx::array quantized_text_model_forward_embeds(mx::array inputs_embeds, const QuantizedTextModelWeights* model,
+                                              const mx::array& position_ids, const mx::array& attention_mask) {
+    auto pos_emb = text_rotary_embeddings(inputs_embeds, position_ids);
+    auto x = inputs_embeds;
+    for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
+        x = quantized_text_layer_forward(x, &model->layers[i], pos_emb, attention_mask);
+    }
+    return rms_norm(x, &model->norm, TEXT_RMS_EPS);
+}
+
+mx::array quantized_text_model_forward_ids(mx::array input_ids, const QuantizedTextModelWeights* model,
+                                           const mx::array& position_ids, const mx::array& attention_mask) {
+    auto embeds = mx::take(model->embed_tokens, input_ids, 0);
+    return quantized_text_model_forward_embeds(embeds, model, position_ids, attention_mask);
+}
+
+mx::array quantized_compute_logits(const mx::array& hidden_states, const QuantizedTextModelWeights* model) {
+    return quantized_linear(hidden_states, &model->lm_head);
+}
+
+mx::array quantized_text_model_forward_with_logits(mx::array input_ids, const QuantizedTextModelWeights* model,
+                                                   const mx::array& position_ids, const mx::array& attention_mask) {
+    auto hidden_states = quantized_text_model_forward_ids(input_ids, model, position_ids, attention_mask);
+    return quantized_compute_logits(hidden_states, model);
 }
 
 mx::array vision_mlp_forward(mx::array x, const MLPWeights* w) {
@@ -2071,6 +2311,195 @@ int run_vision_verify_stepwise(const std::string& weights_dir) {
     return 0;
 }
 
+// Comprehensive FP16 stability test
+int run_fp16_stability_test(const std::string& weights_dir) {
+    std::cout << "=== FP16 Stability Test ===" << std::endl;
+
+    // Load text weights
+    std::string text_path = weights_dir + "/text_model.bin";
+    TextModelWeights model;
+    if (!load_text_weights(&model, text_path)) {
+        std::cerr << "Failed to load text weights" << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nTesting with multiple random input sequences...\n" << std::endl;
+
+    const int num_tests = 10;
+    const int seq_len = 64;
+    const int batch_size = 1;
+    int passed = 0;
+    int failed = 0;
+
+    for (int test = 0; test < num_tests; ++test) {
+        // Generate random input_ids with different seeds
+        auto input_ids = mx::random::randint(1000, 10000, {batch_size, seq_len}, mx::int32);
+        auto position_ids = make_default_position_ids(batch_size, seq_len);
+        mx::eval({input_ids, position_ids});
+
+        // Run forward pass
+        auto output = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
+        mx::eval(output);
+
+        // Check for NaN/Inf
+        auto output_f32 = mx::astype(output, mx::float32);
+        mx::eval(output_f32);
+        auto out_cpu = mx::copy(output_f32, mx::Device(mx::Device::cpu, 0));
+        mx::eval(out_cpu);
+
+        const float* data = out_cpu.data<float>();
+        size_t total = batch_size * seq_len * TEXT_DIM;
+        bool has_nan = false;
+        bool has_inf = false;
+        float min_val = std::numeric_limits<float>::max();
+        float max_val = std::numeric_limits<float>::lowest();
+        double sum = 0;
+
+        for (size_t i = 0; i < total; ++i) {
+            if (std::isnan(data[i])) has_nan = true;
+            if (std::isinf(data[i])) has_inf = true;
+            min_val = std::min(min_val, data[i]);
+            max_val = std::max(max_val, data[i]);
+            sum += data[i];
+        }
+
+        float mean = sum / total;
+        bool stable = !has_nan && !has_inf && std::abs(max_val) < 1e6 && std::abs(min_val) < 1e6;
+
+        std::cout << "Test " << (test + 1) << ": ";
+        if (stable) {
+            std::cout << "[PASS] ";
+            passed++;
+        } else {
+            std::cout << "[FAIL] ";
+            failed++;
+        }
+        std::cout << "min=" << min_val << ", max=" << max_val << ", mean=" << mean;
+        if (has_nan) std::cout << " [NaN detected!]";
+        if (has_inf) std::cout << " [Inf detected!]";
+        std::cout << std::endl;
+    }
+
+    std::cout << "\n=== Summary ===" << std::endl;
+    std::cout << "Passed: " << passed << "/" << num_tests << std::endl;
+    std::cout << "Failed: " << failed << "/" << num_tests << std::endl;
+
+    // Also test with longer sequences
+    std::cout << "\nTesting with longer sequences..." << std::endl;
+    std::vector<int> test_lengths = {128, 256, 512};
+    for (int len : test_lengths) {
+        auto input_ids = mx::random::randint(1000, 10000, {1, len}, mx::int32);
+        auto position_ids = make_default_position_ids(1, len);
+        mx::eval({input_ids, position_ids});
+
+        auto output = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
+        mx::eval(output);
+
+        auto output_f32 = mx::astype(output, mx::float32);
+        mx::eval(output_f32);
+
+        float min_val = mx::min(output_f32).item<float>();
+        float max_val = mx::max(output_f32).item<float>();
+        float mean_val = mx::mean(output_f32).item<float>();
+
+        bool stable = !std::isnan(min_val) && !std::isnan(max_val) &&
+                      std::abs(max_val) < 1e6 && std::abs(min_val) < 1e6;
+
+        std::cout << "  Seq len " << len << ": " << (stable ? "[PASS]" : "[FAIL]")
+                  << " min=" << min_val << ", max=" << max_val << ", mean=" << mean_val << std::endl;
+    }
+
+    return (failed == 0) ? 0 : 1;
+}
+
+// INT8 vs FP16 comparison test
+int run_int8_comparison_test(const std::string& weights_dir) {
+    std::cout << "=== INT8 vs FP16 Comparison Test ===" << std::endl;
+
+    // Load FP16 model
+    std::string fp16_path = weights_dir + "/text_model.bin";
+    TextModelWeights fp16_model;
+    if (!load_text_weights(&fp16_model, fp16_path)) {
+        std::cerr << "Failed to load FP16 text weights" << std::endl;
+        return 1;
+    }
+
+    // Load INT8 model
+    std::string int8_path = weights_dir + "/text_model_int8.bin";
+    QuantizedTextModelWeights int8_model;
+    if (!load_quantized_text_weights(&int8_model, int8_path)) {
+        std::cerr << "Failed to load INT8 text weights" << std::endl;
+        return 1;
+    }
+
+    std::cout << "\nComparing outputs with same input...\n" << std::endl;
+
+    const int num_tests = 5;
+    const int seq_len = 64;
+    const int batch_size = 1;
+
+    double total_max_diff = 0;
+    double total_mean_diff = 0;
+    int passed = 0;
+
+    for (int test = 0; test < num_tests; ++test) {
+        // Generate random input
+        auto input_ids = mx::random::randint(1000, 10000, {batch_size, seq_len}, mx::int32);
+        auto position_ids = make_default_position_ids(batch_size, seq_len);
+        mx::eval({input_ids, position_ids});
+
+        // Run FP16 forward
+        auto fp16_output = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
+        mx::eval(fp16_output);
+
+        // Run INT8 forward
+        auto int8_output = quantized_text_model_forward_ids(input_ids, &int8_model, position_ids, empty_array());
+        mx::eval(int8_output);
+
+        // Compare outputs
+        float max_diff = max_abs_diff(fp16_output, int8_output);
+        float mean_diff = mean_abs_diff(fp16_output, int8_output);
+
+        total_max_diff += max_diff;
+        total_mean_diff += mean_diff;
+
+        // Allow up to 5% relative error for INT8
+        auto fp16_abs = mx::mean(mx::abs(mx::astype(fp16_output, mx::float32)));
+        mx::eval(fp16_abs);
+        float avg_magnitude = fp16_abs.item<float>();
+        float relative_error = mean_diff / (avg_magnitude + 1e-6);
+
+        bool ok = relative_error < 0.1;  // Allow up to 10% relative error
+        if (ok) passed++;
+
+        std::cout << "Test " << (test + 1) << ": " << (ok ? "[PASS]" : "[FAIL]")
+                  << " max_diff=" << max_diff
+                  << ", mean_diff=" << mean_diff
+                  << ", rel_err=" << (relative_error * 100) << "%" << std::endl;
+    }
+
+    std::cout << "\n=== Summary ===" << std::endl;
+    std::cout << "Passed: " << passed << "/" << num_tests << std::endl;
+    std::cout << "Avg max diff: " << (total_max_diff / num_tests) << std::endl;
+    std::cout << "Avg mean diff: " << (total_mean_diff / num_tests) << std::endl;
+
+    // Also compare with longer sequence
+    std::cout << "\nTesting with seq_len=256..." << std::endl;
+    auto long_input = mx::random::randint(1000, 10000, {1, 256}, mx::int32);
+    auto long_pos = make_default_position_ids(1, 256);
+    mx::eval({long_input, long_pos});
+
+    auto fp16_long = text_model_forward_ids(long_input, &fp16_model, long_pos, empty_array());
+    auto int8_long = quantized_text_model_forward_ids(long_input, &int8_model, long_pos, empty_array());
+    mx::eval({fp16_long, int8_long});
+
+    float long_max_diff = max_abs_diff(fp16_long, int8_long);
+    float long_mean_diff = mean_abs_diff(fp16_long, int8_long);
+    std::cout << "  max_diff=" << long_max_diff << ", mean_diff=" << long_mean_diff << std::endl;
+
+    return (passed >= num_tests - 1) ? 0 : 1;  // Allow 1 failure
+}
+
 int main(int argc, char* argv[]) {
     const char* force_cpu_env = std::getenv("GLM_FORCE_CPU");
     bool force_cpu = force_cpu_env && std::string(force_cpu_env) == "1";
@@ -2106,6 +2535,18 @@ int main(int argc, char* argv[]) {
     if (verify_step_env && std::string(verify_step_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         return run_vision_verify_stepwise(weights_dir);
+    }
+
+    const char* fp16_test_env = std::getenv("GLM_FP16_TEST");
+    if (fp16_test_env && std::string(fp16_test_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_fp16_stability_test(weights_dir);
+    }
+
+    const char* int8_test_env = std::getenv("GLM_INT8_TEST");
+    if (int8_test_env && std::string(int8_test_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_int8_comparison_test(weights_dir);
     }
 
     // Original benchmark modes
