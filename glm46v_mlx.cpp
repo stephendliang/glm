@@ -1684,6 +1684,102 @@ int run_text_bench() {
     return 0;
 }
 
+int run_int8_text_bench(const std::string& weights_dir) {
+    const char* batch_env = std::getenv("GLM_BATCH_SIZE");
+    const int B = batch_env ? std::atoi(batch_env) : 16;
+    const int T = GLM_TEXT_SEQ_LEN;
+    const int iters = 20;
+    const int warmup = 5;
+
+    std::cout << "=== INT8 Text Model Throughput Benchmark ===" << std::endl;
+    std::cout << "Loading INT8 quantized text model..." << std::endl;
+
+    QuantizedTextModelWeights model;
+    std::string int8_path = weights_dir + "/text_model_int8.bin";
+    if (!load_quantized_text_weights(&model, int8_path)) {
+        std::cerr << "Failed to load INT8 weights from " << int8_path << std::endl;
+        return 1;
+    }
+    std::cout << "INT8 model loaded." << std::endl;
+
+    std::cout << "\nBenchmark config: B=" << B << ", T=" << T
+              << ", iters=" << iters << ", warmup=" << warmup << std::endl;
+
+    auto input_ids = mx::random::randint(0, TEXT_VOCAB_SIZE, {B, T}, mx::int32);
+    auto position_ids = make_default_position_ids(B, T);
+    mx::eval({input_ids, position_ids});
+
+    std::cout << "Warmup..." << std::endl;
+    for (int i = 0; i < warmup; ++i) {
+        auto out = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
+        mx::eval(out);
+    }
+    mx::synchronize();
+
+    std::cout << "Benchmarking INT8..." << std::endl;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        auto out = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
+        mx::eval(out);
+    }
+    mx::synchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double> elapsed = end - start;
+    double tokens_per_sec = (double)(B * T * iters) / elapsed.count();
+    double ms_per_iter = (elapsed.count() * 1000.0) / iters;
+
+    auto output = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
+    mx::eval(output);
+    mx::synchronize();
+
+    std::cout << "\n=== INT8 Results ===" << std::endl;
+    std::cout << "Output shape: " << output.shape(0) << "x" << output.shape(1)
+              << "x" << output.shape(2) << std::endl;
+    std::cout << "Time per forward: " << ms_per_iter << " ms" << std::endl;
+    std::cout << "Throughput: " << tokens_per_sec << " tokens/s" << std::endl;
+
+    // Also run FP16 for comparison
+    std::cout << "\nLoading FP16 text model for comparison..." << std::endl;
+    TextModelWeights fp16_model;
+    std::string fp16_path = weights_dir + "/text_model.bin";
+    if (!load_text_weights(&fp16_model, fp16_path)) {
+        std::cerr << "Failed to load FP16 weights" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Warmup FP16..." << std::endl;
+    for (int i = 0; i < warmup; ++i) {
+        auto out = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
+        mx::eval(out);
+    }
+    mx::synchronize();
+
+    std::cout << "Benchmarking FP16..." << std::endl;
+    start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        auto out = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
+        mx::eval(out);
+    }
+    mx::synchronize();
+    end = std::chrono::high_resolution_clock::now();
+
+    elapsed = end - start;
+    double fp16_tokens_per_sec = (double)(B * T * iters) / elapsed.count();
+    double fp16_ms_per_iter = (elapsed.count() * 1000.0) / iters;
+
+    std::cout << "\n=== FP16 Results ===" << std::endl;
+    std::cout << "Time per forward: " << fp16_ms_per_iter << " ms" << std::endl;
+    std::cout << "Throughput: " << fp16_tokens_per_sec << " tokens/s" << std::endl;
+
+    std::cout << "\n=== Comparison ===" << std::endl;
+    double speedup = tokens_per_sec / fp16_tokens_per_sec;
+    std::cout << "INT8 vs FP16 speedup: " << speedup << "x" << std::endl;
+    std::cout << "Memory: INT8 ~9.6 GB vs FP16 ~17.9 GB (1.87x smaller)" << std::endl;
+
+    return 0;
+}
+
 // ==================== Vision Verification ====================
 
 int run_vision_verify(const std::string& weights_dir) {
@@ -2547,6 +2643,12 @@ int main(int argc, char* argv[]) {
     if (int8_test_env && std::string(int8_test_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         return run_int8_comparison_test(weights_dir);
+    }
+
+    const char* int8_bench_env = std::getenv("GLM_INT8_BENCH");
+    if (int8_bench_env && std::string(int8_bench_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_int8_text_bench(weights_dir);
     }
 
     // Original benchmark modes

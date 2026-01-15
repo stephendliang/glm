@@ -16,7 +16,7 @@ LDFLAGS = $(MLX_LIB) $(FRAMEWORKS) -Wl,-rpath,/opt/homebrew/lib
 TARGET = glm46v_mlx
 SRC = glm46v_mlx.cpp
 
-.PHONY: all clean run verify verify-step bench bench-text verify-text verify-cpu export-weights test test-fp16 test-int8 export-int8
+.PHONY: all clean run verify verify-step bench bench-text bench-int8 verify-text verify-cpu export-weights test test-fp16 test-int8 export-int8
 
 all: $(TARGET)
 
@@ -52,6 +52,9 @@ export-int8:
 
 test-int8: $(TARGET)
 	GLM_INT8_TEST=1 GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
+
+bench-int8: $(TARGET)
+	GLM_INT8_BENCH=1 GLM_BATCH_SIZE=16 GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
 
 export-weights:
 	python3 export_vision_weights.py
