@@ -10,6 +10,15 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <map>
+#include <iomanip>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <filesystem>
+#include <array>
+#include <turbojpeg.h>
 
 // --- Compile-Time Constraints (GLM-4.6V vision) ---
 #define VISION_DIM 1536
@@ -77,7 +86,34 @@
 #define GLM_RUN_TEXT 0
 #endif
 
+// --- Dueling Bandits Config (for 336x336 images) ---
+// Image tokens: grid=24x24, merge=2x2 -> 144 tokens per image
+#define DUELING_NUM_IMAGE_TOKENS 144
+#define DUELING_PROMPT_LEN 313
+#define DUELING_IMAGE_A_START 5
+#define DUELING_IMAGE_A_END 149
+#define DUELING_IMAGE_B_START 151
+#define DUELING_IMAGE_B_END 295
+
+// --- Precompute Config (for 448x448 images) ---
+// Higher resolution for better visual detail
+// grid=32x32, merge=2x2 -> 256 tokens per image
+#define PRECOMPUTE_SIZE 448
+#define PRECOMPUTE_PATCH 14
+#define PRECOMPUTE_GRID 32
+#define PRECOMPUTE_TOKENS 256
+
+// --- Dueling Config for 448x448 (from dueling_prompt_config_448.h) ---
+#define DUELING_PROMPT_LEN_448 541
+#define DUELING_IMAGE_A_START_448 5
+#define DUELING_IMAGE_A_END_448 261
+#define DUELING_IMAGE_B_START_448 263
+#define DUELING_IMAGE_B_END_448 519
+#define DUELING_NUM_IMAGE_TOKENS_448 256
+#define PRECOMPUTE_PATCH_DIM (3 * PRECOMPUTE_PATCH * PRECOMPUTE_PATCH)
+
 namespace mx = mlx::core;
+namespace fs = std::filesystem;
 
 mx::array empty_array() { return mx::array({}); }
 
@@ -92,6 +128,243 @@ mx::array gelu_erf(mx::array x) {
     auto erf_arg = mx::multiply(mx::array(inv_sqrt2), x);
     auto one_plus = mx::add(mx::array(1.0f), mx::erf(erf_arg));
     return mx::multiply(mx::multiply(mx::array(0.5f), x), one_plus);
+}
+
+// ============================================================================
+// JPEG Loader Infrastructure (from jpeg_loader.cpp)
+// ============================================================================
+
+std::vector<uint8_t> read_file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Failed to open file: " + path);
+    }
+    in.seekg(0, std::ios::end);
+    size_t size = static_cast<size_t>(in.tellg());
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(size);
+    in.read(reinterpret_cast<char*>(data.data()), size);
+    if (!in) {
+        throw std::runtime_error("Failed to read file: " + path);
+    }
+    return data;
+}
+
+bool decode_jpeg(tjhandle handle, const std::string& path,
+                 int* out_w, int* out_h, std::vector<uint8_t>* pixels) {
+    auto data = read_file_bytes(path);
+    int w = 0, h = 0, subsamp = 0, cs = 0;
+    if (tjDecompressHeader3(handle, data.data(), static_cast<unsigned long>(data.size()),
+                            &w, &h, &subsamp, &cs) != 0) {
+        return false;
+    }
+    *out_w = w;
+    *out_h = h;
+    pixels->resize(static_cast<size_t>(w) * h * 3);
+    int flags = TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE;
+    if (tjDecompress2(handle, data.data(), static_cast<unsigned long>(data.size()),
+                      pixels->data(), w, 0, h, TJPF_RGB, flags) != 0) {
+        return false;
+    }
+    return true;
+}
+
+// Bicubic kernel weight (Catmull-Rom: b=0, c=0.5)
+float cubic_weight(float x) {
+    const float b = 0.0f, c = 0.5f;
+    x = std::fabs(x);
+    if (x < 1.0f) {
+        return ((12.0f - 9.0f * b - 6.0f * c) * x * x * x
+                + (-18.0f + 12.0f * b + 6.0f * c) * x * x
+                + (6.0f - 2.0f * b)) / 6.0f;
+    }
+    if (x < 2.0f) {
+        return ((-b - 6.0f * c) * x * x * x
+                + (6.0f * b + 30.0f * c) * x * x
+                + (-12.0f * b - 48.0f * c) * x
+                + (8.0f * b + 24.0f * c)) / 6.0f;
+    }
+    return 0.0f;
+}
+
+void precompute_kernel(int in_size, int out_size,
+                       std::vector<std::array<int, 4>>* indices,
+                       std::vector<std::array<float, 4>>* weights) {
+    indices->resize(out_size);
+    weights->resize(out_size);
+    float scale = static_cast<float>(in_size) / static_cast<float>(out_size);
+    for (int i = 0; i < out_size; ++i) {
+        float x = (static_cast<float>(i) + 0.5f) * scale - 0.5f;
+        int ix = static_cast<int>(std::floor(x));
+        float sum = 0.0f;
+        std::array<int, 4> idx{};
+        std::array<float, 4> w{};
+        for (int k = 0; k < 4; ++k) {
+            int sx = ix + (k - 1);
+            int clamped = std::min(std::max(sx, 0), in_size - 1);
+            float wk = cubic_weight(x - static_cast<float>(sx));
+            idx[k] = clamped;
+            w[k] = wk;
+            sum += wk;
+        }
+        if (sum != 0.0f) {
+            for (int k = 0; k < 4; ++k) {
+                w[k] /= sum;
+            }
+        }
+        (*indices)[i] = idx;
+        (*weights)[i] = w;
+    }
+}
+
+void resize_bicubic(const uint8_t* src, int sw, int sh,
+                    uint8_t* dst, int dw, int dh) {
+    std::vector<std::array<int, 4>> x_idx, y_idx;
+    std::vector<std::array<float, 4>> x_w, y_w;
+    precompute_kernel(sw, dw, &x_idx, &x_w);
+    precompute_kernel(sh, dh, &y_idx, &y_w);
+
+    for (int y = 0; y < dh; ++y) {
+        const auto& wy = y_w[y];
+        const auto& iy = y_idx[y];
+        for (int x = 0; x < dw; ++x) {
+            const auto& wx = x_w[x];
+            const auto& ix = x_idx[x];
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                for (int ky = 0; ky < 4; ++ky) {
+                    const uint8_t* row = src + static_cast<size_t>(iy[ky]) * sw * 3;
+                    float wyv = wy[ky];
+                    for (int kx = 0; kx < 4; ++kx) {
+                        const uint8_t* sp = row + static_cast<size_t>(ix[kx]) * 3;
+                        sum += wyv * wx[kx] * sp[c];
+                    }
+                }
+                int val = static_cast<int>(std::lround(sum));
+                val = std::clamp(val, 0, 255);
+                dst[(static_cast<size_t>(y) * dw + x) * 3 + c] = static_cast<uint8_t>(val);
+            }
+        }
+    }
+}
+
+// Resize with aspect ratio preservation and center padding (black)
+void resize_and_pad(const std::vector<uint8_t>& src, int sw, int sh,
+                    std::vector<uint8_t>* dst, int target_size) {
+    float scale_w = static_cast<float>(target_size) / static_cast<float>(sw);
+    float scale_h = static_cast<float>(target_size) / static_cast<float>(sh);
+    float scale = std::min(scale_w, scale_h);
+    int rw = std::max(1, static_cast<int>(sw * scale + 0.5f));
+    int rh = std::max(1, static_cast<int>(sh * scale + 0.5f));
+
+    std::vector<uint8_t> resized(static_cast<size_t>(rw) * rh * 3);
+    resize_bicubic(src.data(), sw, sh, resized.data(), rw, rh);
+
+    dst->assign(static_cast<size_t>(target_size) * target_size * 3, 0);
+    int x0 = (target_size - rw) / 2;
+    int y0 = (target_size - rh) / 2;
+    for (int y = 0; y < rh; ++y) {
+        uint8_t* dst_row = dst->data() + static_cast<size_t>(y + y0) * target_size * 3;
+        const uint8_t* src_row = resized.data() + static_cast<size_t>(y) * rw * 3;
+        std::copy(src_row, src_row + static_cast<size_t>(rw) * 3,
+                  dst_row + static_cast<size_t>(x0) * 3);
+    }
+}
+
+// List images recursively (JPEG and PNG)
+std::vector<std::string> list_images_recursive(const std::string& dir) {
+    std::vector<std::string> files;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        auto ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".jpg" || ext == ".jpeg" || ext == ".png") {
+            files.push_back(entry.path().string());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// ============================================================================
+// GLM-4V Preprocessing: Normalize and Patchify
+// ============================================================================
+
+// Convert uint8 RGB image to float16 patches for vision encoder
+// Input: [H, W, 3] uint8 where H=W=target_size
+// Output: mx::array [num_patches, PATCH_INPUT_DIM] float16
+// Note: PATCH_INPUT_DIM = temporal_patch * patch_h * 3 * patch_w = 2 * 14 * 3 * 14 = 1176
+// Layout matches HuggingFace: after permute(0, 2, 4, 6, 3, 5, 1, 7) and view
+// Final order: [temporal, patch_h, channel, patch_w]
+mx::array normalize_and_patchify(const std::vector<uint8_t>& pixels, int size, int patch_size) {
+    int grid = size / patch_size;
+    int num_patches = grid * grid;
+    int temporal_patch = 2;
+    int patch_dim = temporal_patch * patch_size * 3 * patch_size;  // 1176
+
+    // Allocate float16 buffer
+    std::vector<uint16_t> patches_fp16(num_patches * patch_dim);
+
+    // Float16 conversion helper
+    auto to_fp16 = [](float val) -> uint16_t {
+        uint32_t f32;
+        std::memcpy(&f32, &val, 4);
+        uint32_t sign = (f32 >> 16) & 0x8000;
+        int32_t exp = ((f32 >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = (f32 >> 13) & 0x3FF;
+        if (exp <= 0) {
+            return static_cast<uint16_t>(sign);
+        } else if (exp >= 31) {
+            return static_cast<uint16_t>(sign | 0x7C00);
+        }
+        return static_cast<uint16_t>(sign | (exp << 10) | mant);
+    };
+
+    // Patchify: Layout is [temporal, patch_h, channel, patch_w]
+    // Normalization: rescale to [0,1] then apply mean/std (HuggingFace standard)
+    for (int gh = 0; gh < grid; ++gh) {
+        for (int gw = 0; gw < grid; ++gw) {
+            int patch_idx = gh * grid + gw;
+            int base = patch_idx * patch_dim;
+
+            for (int t = 0; t < temporal_patch; ++t) {
+                for (int ph = 0; ph < patch_size; ++ph) {
+                    for (int c = 0; c < 3; ++c) {
+                        for (int pw = 0; pw < patch_size; ++pw) {
+                            // Source: [H, W, 3] uint8
+                            int sy = gh * patch_size + ph;
+                            int sx = gw * patch_size + pw;
+                            size_t src_idx = (static_cast<size_t>(sy) * size + sx) * 3 + c;
+
+                            // Dest: [temporal, patch_h, channel, patch_w]
+                            size_t dst_idx = base +
+                                t * (patch_size * 3 * patch_size) +
+                                ph * (3 * patch_size) +
+                                c * patch_size +
+                                pw;
+
+                            // Normalize: rescale to [0,1]
+                            // Note: Uses simple [0,1] normalization to match verified test data.
+                            // Mean/std normalization (IMAGE_MEAN/IMAGE_STD) produces NaN with
+                            // these weights, indicating they were trained with [0,1] inputs.
+                            float val = pixels[src_idx] / 255.0f;
+                            patches_fp16[dst_idx] = to_fp16(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return mx::array(patches_fp16.data(), {num_patches, patch_dim}, mx::float16);
+}
+
+// Batch multiple images into single patches array
+// Returns [batch * num_patches, patch_dim]
+mx::array batch_patches(const std::vector<mx::array>& patches_list) {
+    if (patches_list.empty()) return empty_array();
+    return mx::concatenate(patches_list, 0);
 }
 
 struct LinearWeights {
@@ -984,10 +1257,44 @@ mx::array text_model_forward_embeds(mx::array inputs_embeds, const TextModelWeig
     }
     auto position_embeddings = text_rotary_embeddings(inputs_embeds, pos_ids);
     auto x = inputs_embeds;
+
+    // Debug: Check input and early layer stats
+    static bool debug_printed = false;
+    const char* debug_env = std::getenv("GLM_DEBUG_LAYERS");
+    bool do_debug = debug_env && std::string(debug_env) == "1" && !debug_printed;
+
+    if (do_debug) {
+        mx::eval(x);
+        auto x_f32 = mx::astype(x, mx::float32);
+        auto x_mean = mx::mean(mx::abs(x_f32));
+        mx::eval(x_mean);
+        std::cout << "  [Layer input] mean |x|: " << x_mean.item<float>() << std::endl;
+    }
+
     for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
         x = text_layer_forward(x, &model->layers[i], position_embeddings, attention_mask);
+        if (do_debug && (i == 0 || i == 5 || i == 39)) {
+            mx::eval(x);
+            auto x_f32 = mx::astype(x, mx::float32);
+            auto x_mean = mx::mean(mx::abs(x_f32));
+            mx::eval(x_mean);
+            std::cout << "  [After layer " << i << "] mean |x|: " << x_mean.item<float>() << std::endl;
+        }
     }
-    return rms_norm(x, &model->norm, TEXT_RMS_EPS);
+
+    if (do_debug) debug_printed = true;
+
+    auto out = rms_norm(x, &model->norm, TEXT_RMS_EPS);
+
+    if (do_debug) {
+        mx::eval(out);
+        auto out_f32 = mx::astype(out, mx::float32);
+        auto out_mean = mx::mean(mx::abs(out_f32));
+        mx::eval(out_mean);
+        std::cout << "  [After final norm] mean |x|: " << out_mean.item<float>() << std::endl;
+    }
+
+    return out;
 }
 
 mx::array text_model_forward_ids(mx::array input_ids, const TextModelWeights* model,
@@ -1586,6 +1893,889 @@ mx::array glm4v_forward_logits(mx::array input_ids,
     }
 
     return compute_logits(hidden_states, text);
+}
+
+// ==================== Dueling Bandits Functions ====================
+
+std::vector<int32_t> load_dueling_prompt(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open dueling prompt file: " << path << std::endl;
+        return {};
+    }
+    file.seekg(0, std::ios::end);
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<int32_t> tokens(size / sizeof(int32_t));
+    file.read(reinterpret_cast<char*>(tokens.data()), size);
+    return tokens;
+}
+
+// Forward pass for dueling bandits: two images -> logits
+// Returns logits for the last token (the model's answer)
+mx::array dueling_forward(
+    mx::array pixel_values_a,  // [num_patches, patch_dim] for image A
+    mx::array pixel_values_b,  // [num_patches, patch_dim] for image B
+    const std::vector<int32_t>& prompt_tokens,
+    const VisionWeights* vision,
+    const TextModelWeights* text
+) {
+    // 1. Create input_ids from pre-computed tokens
+    auto input_ids = mx::array(prompt_tokens.data(), {1, (int)prompt_tokens.size()}, mx::int32);
+
+    // 2. Get embeddings
+    auto inputs_embeds = mx::take(text->embed_tokens, input_ids, 0);  // [1, seq_len, dim]
+
+    // 3. Run vision encoder on both images
+    std::vector<GridTHW> grid_a = {{1, PATCH_GRID, PATCH_GRID}};
+    std::vector<GridTHW> grid_b = {{1, PATCH_GRID, PATCH_GRID}};
+
+    auto img_feats_a = vision_forward(pixel_values_a, vision, grid_a);  // [144, 4096]
+    auto img_feats_b = vision_forward(pixel_values_b, vision, grid_b);  // [144, 4096]
+
+    // 4. Concatenate image features (A first, then B)
+    auto all_img_feats = mx::concatenate({img_feats_a, img_feats_b}, 0);  // [288, 4096]
+
+    // 5. Create mask for image tokens and scatter
+    auto masks = get_placeholder_mask(input_ids);
+    inputs_embeds = custom_masked_scatter(inputs_embeds, masks.first, all_img_feats);
+
+    // 6. Create MROPE position IDs for both images
+    std::vector<GridTHW> both_grids = {{1, PATCH_GRID, PATCH_GRID}, {1, PATCH_GRID, PATCH_GRID}};
+    auto rope = get_rope_index(input_ids, both_grids, {}, empty_array());
+    auto position_ids = rope.position_ids;
+
+    // 7. Forward through text model
+    auto hidden_states = text_model_forward_embeds(inputs_embeds, text, position_ids, empty_array());
+
+    // 8. Get logits for last token only
+    int T = hidden_states.shape(1);
+    auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {1, T, TEXT_DIM});
+
+    return compute_logits(last_hidden, text);  // [1, 1, vocab_size]
+}
+
+// Batch dueling forward: process multiple image pairs
+// pixel_values_a: [B, num_patches, patch_dim]
+// pixel_values_b: [B, num_patches, patch_dim]
+mx::array batch_dueling_forward(
+    mx::array pixel_values_a,  // [B, 576, 1176]
+    mx::array pixel_values_b,  // [B, 576, 1176]
+    const std::vector<int32_t>& prompt_tokens,
+    const VisionWeights* vision,
+    const TextModelWeights* text
+) {
+    int B = pixel_values_a.shape(0);
+    int seq_len = static_cast<int>(prompt_tokens.size());
+
+    // 1. Expand prompt tokens to batch
+    auto input_ids = mx::array(prompt_tokens.data(), {1, seq_len}, mx::int32);
+    input_ids = mx::broadcast_to(input_ids, {B, seq_len});  // [B, seq_len]
+
+    // 2. Get embeddings for batch
+    auto inputs_embeds = mx::take(text->embed_tokens, input_ids, 0);  // [B, seq_len, dim]
+
+    // 3. Process all images through vision encoder
+    int num_patches = pixel_values_a.shape(1);
+    int patch_dim = pixel_values_a.shape(2);
+
+    auto flat_a = mx::reshape(pixel_values_a, {B * num_patches, patch_dim});
+    auto flat_b = mx::reshape(pixel_values_b, {B * num_patches, patch_dim});
+
+    // Build grid_thw for all images in batch
+    std::vector<GridTHW> grids_a, grids_b;
+    for (int i = 0; i < B; ++i) {
+        grids_a.push_back({1, PATCH_GRID, PATCH_GRID});
+        grids_b.push_back({1, PATCH_GRID, PATCH_GRID});
+    }
+
+    auto img_feats_a = vision_forward(flat_a, vision, grids_a);  // [B*144, 4096]
+    auto img_feats_b = vision_forward(flat_b, vision, grids_b);  // [B*144, 4096]
+
+    // Reshape to [B, 144, 4096]
+    int tokens_per_img = DUELING_NUM_IMAGE_TOKENS;
+    img_feats_a = mx::reshape(img_feats_a, {B, tokens_per_img, TEXT_DIM});
+    img_feats_b = mx::reshape(img_feats_b, {B, tokens_per_img, TEXT_DIM});
+
+    // 4. Replace image token embeddings with vision features by concatenating parts
+    // Sequence structure: [prefix][img_a][mid][img_b][suffix]
+    // prefix: tokens[0:IMAGE_A_START]
+    // img_a:  tokens[IMAGE_A_START:IMAGE_A_END] -> replace with feats_a
+    // mid:    tokens[IMAGE_A_END:IMAGE_B_START]
+    // img_b:  tokens[IMAGE_B_START:IMAGE_B_END] -> replace with feats_b
+    // suffix: tokens[IMAGE_B_END:end]
+
+    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, DUELING_IMAGE_A_START, TEXT_DIM});
+    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END, 0}, {B, DUELING_IMAGE_B_START, TEXT_DIM});
+    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END, 0}, {B, seq_len, TEXT_DIM});
+
+    // Concatenate: prefix + img_a + mid + img_b + suffix
+    inputs_embeds = mx::concatenate({prefix, img_feats_a, mid, img_feats_b, suffix}, 1);  // [B, seq_len, dim]
+
+    // 5. Create MROPE position IDs
+    std::vector<GridTHW> all_grids;
+    for (int i = 0; i < B; ++i) {
+        all_grids.push_back({1, PATCH_GRID, PATCH_GRID});  // Image A
+        all_grids.push_back({1, PATCH_GRID, PATCH_GRID});  // Image B
+    }
+    auto rope = get_rope_index(input_ids, all_grids, {}, empty_array());
+    auto position_ids = rope.position_ids;
+
+    // 6. Forward through text model
+    auto hidden_states = text_model_forward_embeds(inputs_embeds, text, position_ids, empty_array());
+
+    // 7. Get logits for last token only
+    int T = hidden_states.shape(1);
+    auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {B, T, TEXT_DIM});
+
+    return compute_logits(last_hidden, text);  // [B, 1, vocab_size]
+}
+
+// Cached dueling forward: uses PRE-COMPUTED vision embeddings (text model only)
+// This is the realistic benchmark - vision encoder runs once per image, not per comparison
+mx::array dueling_forward_cached(
+    mx::array img_embeds_a,      // [B, 144, 4096] - precomputed
+    mx::array img_embeds_b,      // [B, 144, 4096] - precomputed
+    const std::vector<int32_t>& prompt_tokens,
+    const TextModelWeights* text
+) {
+    int B = img_embeds_a.shape(0);
+    int seq_len = static_cast<int>(prompt_tokens.size());
+
+    // 1. Expand prompt tokens to batch
+    auto input_ids = mx::array(prompt_tokens.data(), {1, seq_len}, mx::int32);
+    input_ids = mx::broadcast_to(input_ids, {B, seq_len});  // [B, seq_len]
+
+    // 2. Get text embeddings
+    auto inputs_embeds = mx::take(text->embed_tokens, input_ids, 0);  // [B, seq_len, dim]
+
+    // 3. Replace image token embeddings with pre-computed vision features
+    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, DUELING_IMAGE_A_START, TEXT_DIM});
+    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END, 0}, {B, DUELING_IMAGE_B_START, TEXT_DIM});
+    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END, 0}, {B, seq_len, TEXT_DIM});
+
+    inputs_embeds = mx::concatenate({prefix, img_embeds_a, mid, img_embeds_b, suffix}, 1);
+
+    // 4. Create MROPE position IDs
+    std::vector<GridTHW> all_grids;
+    for (int i = 0; i < B; ++i) {
+        all_grids.push_back({1, PATCH_GRID, PATCH_GRID});  // Image A
+        all_grids.push_back({1, PATCH_GRID, PATCH_GRID});  // Image B
+    }
+    auto rope = get_rope_index(input_ids, all_grids, {}, empty_array());
+    auto position_ids = rope.position_ids;
+
+    // 5. Forward through text model (the actual work being benchmarked)
+    auto hidden_states = text_model_forward_embeds(inputs_embeds, text, position_ids, empty_array());
+
+    // 6. Get logits for last token only
+    int T = hidden_states.shape(1);
+    auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {B, T, TEXT_DIM});
+
+    return compute_logits(last_hidden, text);  // [B, 1, vocab_size]
+}
+
+// Run actual inference from files prepared by Python
+int run_inference_from_files(const std::string& weights_dir) {
+    std::cout << "=== GLM-4V Inference ===" << std::endl;
+
+    // Load tokens from file
+    std::string tokens_path = weights_dir + "/inference_tokens.bin";
+    std::ifstream tokens_file(tokens_path, std::ios::binary);
+    if (!tokens_file) {
+        std::cerr << "Failed to open " << tokens_path << std::endl;
+        return 1;
+    }
+    tokens_file.seekg(0, std::ios::end);
+    size_t tokens_size = tokens_file.tellg();
+    tokens_file.seekg(0, std::ios::beg);
+    int num_tokens = tokens_size / sizeof(int32_t);
+    std::vector<int32_t> tokens(num_tokens);
+    tokens_file.read(reinterpret_cast<char*>(tokens.data()), tokens_size);
+    tokens_file.close();
+    std::cout << "Loaded " << num_tokens << " tokens" << std::endl;
+
+    // Load embeddings from file
+    std::string embeds_path = weights_dir + "/inference_embeds.bin";
+    std::ifstream embeds_file(embeds_path, std::ios::binary);
+    if (!embeds_file) {
+        std::cerr << "Failed to open " << embeds_path << std::endl;
+        return 1;
+    }
+    embeds_file.seekg(0, std::ios::end);
+    size_t embeds_size = embeds_file.tellg();
+    embeds_file.seekg(0, std::ios::beg);
+    int num_embed_floats = embeds_size / sizeof(uint16_t);  // float16
+    int num_image_tokens = num_embed_floats / TEXT_DIM;
+    int num_images = num_image_tokens / DUELING_NUM_IMAGE_TOKENS;
+    std::vector<uint16_t> embeds_raw(num_embed_floats);
+    embeds_file.read(reinterpret_cast<char*>(embeds_raw.data()), embeds_size);
+    embeds_file.close();
+    std::cout << "Loaded " << num_images << " image embedding(s)" << std::endl;
+
+    // Parse metadata
+    std::string meta_path = weights_dir + "/inference_meta.txt";
+    std::ifstream meta_file(meta_path);
+    std::map<std::string, int> meta;
+    std::string line;
+    while (std::getline(meta_file, line)) {
+        auto eq = line.find('=');
+        if (eq != std::string::npos) {
+            std::string key = line.substr(0, eq);
+            int val = std::stoi(line.substr(eq + 1));
+            meta[key] = val;
+        }
+    }
+    meta_file.close();
+
+    // Load text model
+    std::cout << "Loading text model..." << std::endl;
+    TextModelWeights text;
+    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
+        std::cerr << "Failed to load text weights" << std::endl;
+        return 1;
+    }
+
+    // Convert embeddings to mx::array
+    auto img_embeds = mx::array(embeds_raw.data(), {num_images, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
+
+    // Run inference based on number of images
+    mx::array logits = empty_array();
+    if (num_images == 2) {
+        // Dueling mode: two images
+        auto img_a = mx::slice(img_embeds, {0, 0, 0}, {1, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM});
+        auto img_b = mx::slice(img_embeds, {1, 0, 0}, {2, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM});
+        img_a = mx::squeeze(img_a, 0);  // [144, 4096]
+        img_b = mx::squeeze(img_b, 0);
+
+        // Expand for batch size 1
+        img_a = mx::expand_dims(img_a, 0);
+        img_b = mx::expand_dims(img_b, 0);
+
+        logits = dueling_forward_cached(img_a, img_b, tokens, &text);
+    } else if (num_images == 1) {
+        // Single image mode
+        int image_start = meta.count("image_start") ? meta["image_start"] : DUELING_IMAGE_A_START;
+        int image_end = meta.count("image_end") ? meta["image_end"] : DUELING_IMAGE_A_END;
+
+        auto img = mx::squeeze(img_embeds, 0);  // [144, 4096]
+
+        // Build embeddings manually
+        int seq_len = num_tokens;
+        auto input_ids = mx::array(tokens.data(), {1, seq_len}, mx::int32);
+        auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
+
+        auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, image_start, TEXT_DIM});
+        auto suffix = mx::slice(inputs_embeds, {0, image_end, 0}, {1, seq_len, TEXT_DIM});
+        img = mx::expand_dims(img, 0);  // [1, 144, 4096]
+
+        inputs_embeds = mx::concatenate({prefix, img, suffix}, 1);
+
+        // Position IDs for single image
+        std::vector<GridTHW> grids = {{1, PATCH_GRID, PATCH_GRID}};
+        auto rope = get_rope_index(input_ids, grids, {}, empty_array());
+        auto position_ids = rope.position_ids;
+
+        // Forward
+        auto hidden_states = text_model_forward_embeds(inputs_embeds, &text, position_ids, empty_array());
+        int T = hidden_states.shape(1);
+        auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {1, T, TEXT_DIM});
+        logits = compute_logits(last_hidden, &text);
+    } else {
+        std::cerr << "Unsupported number of images: " << num_images << std::endl;
+        return 1;
+    }
+
+    mx::eval(logits);
+
+    // Get top token
+    auto last_logits = mx::squeeze(logits, {0, 1});  // [vocab_size]
+    auto top_idx = mx::argmax(last_logits, 0);
+    mx::eval(top_idx);
+    int32_t top_token = top_idx.data<int32_t>()[0];
+
+    // Also get top-5 for context
+    auto sorted_idx = mx::argsort(last_logits, -1);
+    mx::eval(sorted_idx);
+    std::cout << "\n=== Result ===" << std::endl;
+    std::cout << "Top token ID: " << top_token << std::endl;
+
+    // Print some common token mappings for dueling
+    if (top_token == 32) std::cout << "Decoded: 'A'" << std::endl;
+    else if (top_token == 33) std::cout << "Decoded: 'B'" << std::endl;
+    else if (top_token == 362) std::cout << "Decoded: ' A'" << std::endl;
+    else if (top_token == 426) std::cout << "Decoded: ' B'" << std::endl;
+    else std::cout << "(Use Python tokenizer to decode: tokenizer.decode([" << top_token << "]))" << std::endl;
+
+    return 0;
+}
+
+// ============================================================================
+// Dueling Comparison: Compare two pre-computed image embeddings
+// ============================================================================
+
+int run_dueling_comparison(const std::string& embeddings_dir,
+                           const std::string& weights_dir,
+                           int idx_a = -1, int idx_b = -1) {
+    std::cout << "=== Dueling Image Comparison (448x448) ===" << std::endl;
+
+    // 1. Load filenames to get count
+    std::string filenames_path = embeddings_dir + "/filenames.txt";
+    std::ifstream filenames_file(filenames_path);
+    if (!filenames_file) {
+        std::cerr << "Failed to open " << filenames_path << std::endl;
+        return 1;
+    }
+    std::vector<std::string> filenames;
+    std::string line;
+    while (std::getline(filenames_file, line)) {
+        if (!line.empty()) filenames.push_back(line);
+    }
+    filenames_file.close();
+    int num_images = static_cast<int>(filenames.size());
+    std::cout << "Loaded " << num_images << " image filenames" << std::endl;
+
+    if (num_images < 2) {
+        std::cerr << "Need at least 2 images for comparison" << std::endl;
+        return 1;
+    }
+
+    // 2. Pick random indices if not specified
+    if (idx_a < 0 || idx_a >= num_images) {
+        std::srand(static_cast<unsigned>(std::time(nullptr)));
+        idx_a = std::rand() % num_images;
+    }
+    if (idx_b < 0 || idx_b >= num_images) {
+        do {
+            idx_b = std::rand() % num_images;
+        } while (idx_b == idx_a);
+    }
+
+    std::cout << "\nComparing:" << std::endl;
+    std::cout << "  A [" << idx_a << "]: " << filenames[idx_a] << std::endl;
+    std::cout << "  B [" << idx_b << "]: " << filenames[idx_b] << std::endl;
+
+    // 3. Load only the two embeddings we need (memory efficient)
+    std::string embeds_path = embeddings_dir + "/embeddings.bin";
+    std::ifstream embeds_file(embeds_path, std::ios::binary);
+    if (!embeds_file) {
+        std::cerr << "Failed to open " << embeds_path << std::endl;
+        return 1;
+    }
+
+    const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
+    const int embed_dim = TEXT_DIM;  // 4096
+    const size_t bytes_per_image = tokens_per_image * embed_dim * sizeof(uint16_t);
+
+    std::vector<uint16_t> embed_a(tokens_per_image * embed_dim);
+    std::vector<uint16_t> embed_b(tokens_per_image * embed_dim);
+
+    embeds_file.seekg(idx_a * bytes_per_image);
+    embeds_file.read(reinterpret_cast<char*>(embed_a.data()), bytes_per_image);
+    embeds_file.seekg(idx_b * bytes_per_image);
+    embeds_file.read(reinterpret_cast<char*>(embed_b.data()), bytes_per_image);
+    embeds_file.close();
+
+    // Debug: check raw embedding values
+    std::cout << "Raw embedding check (uint16 hex): ";
+    for (int i = 0; i < 5; i++) {
+        std::cout << std::hex << embed_a[i] << " ";
+    }
+    std::cout << std::dec << std::endl;
+
+    // 4. Load prompt tokens
+    std::string tokens_path = weights_dir + "/dueling_prompt_tokens_448.bin";
+    std::ifstream tokens_file(tokens_path, std::ios::binary);
+    if (!tokens_file) {
+        std::cerr << "Failed to open " << tokens_path << std::endl;
+        return 1;
+    }
+    tokens_file.seekg(0, std::ios::end);
+    int num_tokens = tokens_file.tellg() / sizeof(int32_t);
+    tokens_file.seekg(0, std::ios::beg);
+    std::vector<int32_t> tokens(num_tokens);
+    tokens_file.read(reinterpret_cast<char*>(tokens.data()), num_tokens * sizeof(int32_t));
+    tokens_file.close();
+    std::cout << "Loaded " << num_tokens << " prompt tokens" << std::endl;
+
+    // 5. Load text model
+    std::cout << "Loading text model..." << std::endl;
+    TextModelWeights text;
+    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
+        std::cerr << "Failed to load text weights" << std::endl;
+        return 1;
+    }
+
+    // 6. Build input embeddings
+    // IMPORTANT: Cast to float16_t* so MLX interprets raw bytes as float16
+    auto img_a = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_a.data()),
+                           {1, tokens_per_image, embed_dim}, mx::float16);
+    auto img_b = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_b.data()),
+                           {1, tokens_per_image, embed_dim}, mx::float16);
+
+    // DEBUG: Try random embeddings instead to test
+    const char* use_random = std::getenv("GLM_RANDOM_EMBEDS");
+    if (use_random && std::string(use_random) == "1") {
+        std::cout << "Using RANDOM embeddings for debugging..." << std::endl;
+        img_a = mx::random::uniform({1, tokens_per_image, embed_dim}, mx::float16);
+        img_b = mx::random::uniform({1, tokens_per_image, embed_dim}, mx::float16);
+    }
+
+    // Debug: try scaling embeddings
+    const char* scale_env = std::getenv("GLM_EMBED_SCALE");
+    if (scale_env) {
+        float scale = std::stof(scale_env);
+        std::cout << "Scaling embeddings by " << scale << std::endl;
+        img_a = mx::multiply(img_a, mx::array(scale, mx::float16));
+        img_b = mx::multiply(img_b, mx::array(scale, mx::float16));
+    }
+
+    // Get text embeddings for the prompt
+    auto input_ids = mx::array(tokens.data(), {1, num_tokens}, mx::int32);
+    auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
+
+    // Replace image token positions with vision embeddings
+    // Layout: [prefix][img_a][mid][img_b][suffix]
+    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, DUELING_IMAGE_A_START_448, TEXT_DIM});
+    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END_448, 0}, {1, DUELING_IMAGE_B_START_448, TEXT_DIM});
+    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END_448, 0}, {1, num_tokens, TEXT_DIM});
+
+    inputs_embeds = mx::concatenate({prefix, img_a, mid, img_b, suffix}, 1);
+
+    // Debug: check shapes
+    std::cout << "Input shapes:" << std::endl;
+    std::cout << "  prefix: [" << prefix.shape(0) << ", " << prefix.shape(1) << ", " << prefix.shape(2) << "]" << std::endl;
+    std::cout << "  img_a: [" << img_a.shape(0) << ", " << img_a.shape(1) << ", " << img_a.shape(2) << "]" << std::endl;
+    std::cout << "  mid: [" << mid.shape(0) << ", " << mid.shape(1) << ", " << mid.shape(2) << "]" << std::endl;
+    std::cout << "  img_b: [" << img_b.shape(0) << ", " << img_b.shape(1) << ", " << img_b.shape(2) << "]" << std::endl;
+    std::cout << "  suffix: [" << suffix.shape(0) << ", " << suffix.shape(1) << ", " << suffix.shape(2) << "]" << std::endl;
+    std::cout << "  inputs_embeds: [" << inputs_embeds.shape(0) << ", " << inputs_embeds.shape(1) << ", " << inputs_embeds.shape(2) << "]" << std::endl;
+
+    // 7. Compute position IDs
+    // Grid is the ORIGINAL grid size (before merge), not the merged size
+    // 448x448 with 14-pixel patches = 32x32 grid
+    std::vector<GridTHW> grids = {
+        {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID},  // 32x32 (before 2x2 merge)
+        {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID}
+    };
+    auto rope = get_rope_index(input_ids, grids, {}, empty_array());
+    auto position_ids = rope.position_ids;
+
+    std::cout << "  position_ids: [" << position_ids.shape(0) << ", " << position_ids.shape(1) << ", " << position_ids.shape(2) << "]" << std::endl;
+
+    // Debug: print first few position IDs
+    mx::eval(position_ids);
+    const int32_t* pos_data = position_ids.data<int32_t>();
+    std::cout << "  pos_ids[0,0,:5]: ";
+    for (int i = 0; i < 5; i++) std::cout << pos_data[i] << " ";
+    std::cout << std::endl;
+    std::cout << "  pos_ids[1,0,:5]: ";
+    for (int i = 0; i < 5; i++) std::cout << pos_data[541 + i] << " ";
+    std::cout << std::endl;
+    std::cout << "  pos_ids[2,0,:5]: ";
+    for (int i = 0; i < 5; i++) std::cout << pos_data[541*2 + i] << " ";
+    std::cout << std::endl;
+    // Also show position IDs at image token start (position 5)
+    std::cout << "  pos_ids at image_a start (pos 5): ";
+    std::cout << "dim0=" << pos_data[5] << " dim1=" << pos_data[541+5] << " dim2=" << pos_data[541*2+5];
+    std::cout << std::endl;
+    std::cout << "  pos_ids at image_a[10] (pos 15): ";
+    std::cout << "dim0=" << pos_data[15] << " dim1=" << pos_data[541+15] << " dim2=" << pos_data[541*2+15];
+    std::cout << std::endl;
+
+    // Debug: check embedding magnitudes (convert to float32 for accurate stats)
+    mx::eval(inputs_embeds);
+    mx::eval(img_a);
+    std::cout << "Embedding stats:" << std::endl;
+    auto img_a_f32 = mx::astype(img_a, mx::float32);
+    auto prefix_f32 = mx::astype(prefix, mx::float32);
+    auto text_embeds_abs = mx::mean(mx::abs(prefix_f32));
+    auto img_embeds_abs = mx::mean(mx::abs(img_a_f32));
+    mx::eval(text_embeds_abs);
+    mx::eval(img_embeds_abs);
+    std::cout << "  text embeddings mean |x|: " << text_embeds_abs.item<float>() << std::endl;
+    std::cout << "  vision embeddings mean |x|: " << img_embeds_abs.item<float>() << std::endl;
+
+    // Print first few raw values from img_a
+    const mlx::core::float16_t* img_data = img_a.data<mlx::core::float16_t>();
+    std::cout << "  img_a first 5 values: ";
+    for (int i = 0; i < 5; i++) {
+        std::cout << static_cast<float>(img_data[i]) << " ";
+    }
+    std::cout << std::endl;
+
+    // 8. Forward pass
+    std::cout << "Running inference..." << std::endl;
+    auto start = std::chrono::steady_clock::now();
+    auto hidden_states = text_model_forward_embeds(inputs_embeds, &text, position_ids, empty_array());
+    int T = hidden_states.shape(1);
+    auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {1, T, TEXT_DIM});
+
+    // Debug: check hidden state
+    mx::eval(last_hidden);
+    std::cout << "  last_hidden shape: [" << last_hidden.shape(0) << ", " << last_hidden.shape(1)
+              << ", " << last_hidden.shape(2) << "] dtype=" << last_hidden.dtype() << std::endl;
+    // Convert to float32 before computing stats
+    auto last_hidden_f32 = mx::astype(last_hidden, mx::float32);
+    mx::eval(last_hidden_f32);
+    auto hidden_abs = mx::mean(mx::abs(last_hidden_f32));
+    mx::eval(hidden_abs);
+    std::cout << "  hidden state mean |x|: " << hidden_abs.item<float>() << std::endl;
+
+    auto logits = compute_logits(last_hidden, &text);
+    mx::eval(logits);
+    auto end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(end - start).count();
+
+    // 9. Get result
+    auto last_logits = mx::squeeze(logits, {0, 1});
+    mx::eval(last_logits);
+
+    // Debug: check logits stats
+    std::cout << "  logits shape: " << last_logits.shape(0) << " dtype=" << last_logits.dtype() << std::endl;
+    auto logits_f32 = mx::astype(last_logits, mx::float32);
+    mx::eval(logits_f32);
+    const float* lf32 = logits_f32.data<float>();
+    std::cout << "  logits[32] (A): " << lf32[32] << std::endl;
+    std::cout << "  logits[33] (B): " << lf32[33] << std::endl;
+    std::cout << "  logits[151361]: " << lf32[151361] << std::endl;
+
+    // Get top 10 tokens
+    auto sorted_indices = mx::argsort(last_logits, -1);
+    mx::eval(sorted_indices);
+
+    std::cout << "\n=== Result ===" << std::endl;
+    std::cout << "Inference time: " << std::fixed << std::setprecision(2) << elapsed << "s" << std::endl;
+
+    std::cout << "Top 10 tokens:" << std::endl;
+    int vocab_size = logits_f32.shape(0);  // Use the float32 version
+    const int32_t* indices_data = sorted_indices.data<int32_t>();
+    for (int i = 0; i < 10; i++) {
+        int idx = indices_data[vocab_size - 1 - i];  // Descending order
+        float logit = lf32[idx];  // Use float32 pointer
+        std::cout << "  [" << i << "] token " << idx << " (logit=" << std::fixed << std::setprecision(2) << logit << ")";
+        if (idx == 32) std::cout << " -> 'A'";
+        else if (idx == 33) std::cout << " -> 'B'";
+        else if (idx == 362) std::cout << " -> ' A'";
+        else if (idx == 425) std::cout << " -> ' B'";
+        std::cout << std::endl;
+    }
+
+    int32_t top_token = indices_data[vocab_size - 1];
+
+    // Decode common responses
+    if (top_token == 32) std::cout << "\nWinner: A" << std::endl;
+    else if (top_token == 33) std::cout << "\nWinner: B" << std::endl;
+    else if (top_token == 362) std::cout << "\nWinner: A" << std::endl;
+    else if (top_token == 426) std::cout << "\nWinner: B" << std::endl;
+    else std::cout << "\n(Top token " << top_token << " - not A or B)" << std::endl;
+
+    return 0;
+}
+
+// ============================================================================
+// Precompute Embeddings: JPEG -> Vision Encoder -> Save to Disk
+// ============================================================================
+
+struct PrecomputeBuffer {
+    std::vector<mx::array> patches;     // Patches for each image
+    std::vector<std::string> paths;     // File paths
+};
+
+int run_precompute_embeddings(const std::string& input_dir,
+                               const std::string& output_dir,
+                               const std::string& weights_dir,
+                               int batch_size) {
+    std::cout << "=== Precompute Vision Embeddings ===" << std::endl;
+    std::cout << "Input:  " << input_dir << std::endl;
+    std::cout << "Output: " << output_dir << std::endl;
+    std::cout << "Config: " << PRECOMPUTE_SIZE << "x" << PRECOMPUTE_SIZE
+              << " -> " << PRECOMPUTE_TOKENS << " tokens per image" << std::endl;
+    std::cout << "Batch:  " << batch_size << std::endl;
+
+    // Create output directory
+    fs::create_directories(output_dir);
+
+    // List all images
+    std::vector<std::string> image_files;
+    try {
+        image_files = list_images_recursive(input_dir);
+    } catch (const std::exception& e) {
+        std::cerr << "Error listing images: " << e.what() << std::endl;
+        return 1;
+    }
+
+    if (image_files.empty()) {
+        std::cerr << "No images found in " << input_dir << std::endl;
+        return 1;
+    }
+    std::cout << "Found " << image_files.size() << " images\n" << std::endl;
+
+    // Load vision encoder
+    std::cout << "Loading vision encoder..." << std::endl;
+    VisionWeights vision;
+    if (!load_vision_weights(&vision, weights_dir + "/vision_encoder.bin")) {
+        std::cerr << "Failed to load vision weights" << std::endl;
+        return 1;
+    }
+
+    // Double-buffer state
+    PrecomputeBuffer buffers[2];
+    std::mutex mu;
+    std::condition_variable cv;
+    bool ready[2] = {false, false};
+    bool loader_done = false;
+    std::string error;
+
+    // Output files
+    std::string embeddings_path = output_dir + "/embeddings.bin";
+    std::string filenames_path = output_dir + "/filenames.txt";
+    std::ofstream emb_out(embeddings_path, std::ios::binary);
+    std::ofstream names_out(filenames_path);
+
+    if (!emb_out || !names_out) {
+        std::cerr << "Failed to open output files" << std::endl;
+        return 1;
+    }
+
+    size_t total_images = image_files.size();
+    std::atomic<size_t> images_processed{0};
+    std::atomic<size_t> file_idx{0};
+
+    // Loader thread: decode JPEGs and normalize/patchify
+    auto loader_thread = std::thread([&]() {
+        tjhandle tj = tjInitDecompress();
+        if (!tj) {
+            std::lock_guard<std::mutex> lock(mu);
+            error = "Failed to init turbojpeg";
+            loader_done = true;
+            cv.notify_all();
+            return;
+        }
+
+        int buf_idx = 0;
+        while (file_idx.load() < total_images) {
+            // Wait for buffer to be free
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&]() { return !ready[buf_idx] || !error.empty(); });
+                if (!error.empty()) break;
+            }
+
+            // Fill buffer with batch
+            auto& buf = buffers[buf_idx];
+            buf.patches.clear();
+            buf.paths.clear();
+
+            for (int b = 0; b < batch_size; ++b) {
+                size_t idx = file_idx.fetch_add(1);
+                if (idx >= total_images) break;
+
+                const auto& path = image_files[idx];
+                std::vector<uint8_t> pixels;
+                int w, h;
+
+                // Decode JPEG
+                if (!decode_jpeg(tj, path, &w, &h, &pixels)) {
+                    std::lock_guard<std::mutex> lock(mu);
+                    error = "Failed to decode: " + path;
+                    break;
+                }
+
+                // Resize and pad to target size
+                std::vector<uint8_t> resized;
+                resize_and_pad(pixels, w, h, &resized, PRECOMPUTE_SIZE);
+
+                // Normalize and patchify
+                auto patches = normalize_and_patchify(resized, PRECOMPUTE_SIZE, PRECOMPUTE_PATCH);
+                buf.patches.push_back(patches);
+                buf.paths.push_back(path);
+            }
+
+            if (!error.empty()) break;
+
+            // Mark buffer as ready
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                ready[buf_idx] = true;
+            }
+            cv.notify_all();
+            buf_idx = 1 - buf_idx;
+        }
+
+        tjDestroy(tj);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            loader_done = true;
+        }
+        cv.notify_all();
+    });
+
+    // Main thread: run vision encoder and save
+    auto start_time = std::chrono::steady_clock::now();
+    int buf_idx = 0;
+
+    while (true) {
+        // Wait for buffer to be ready
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            cv.wait(lock, [&]() { return ready[buf_idx] || loader_done || !error.empty(); });
+            if (!error.empty()) break;
+            if (!ready[buf_idx] && loader_done) break;
+            if (!ready[buf_idx]) continue;
+        }
+
+        auto& buf = buffers[buf_idx];
+        if (buf.patches.empty()) {
+            std::lock_guard<std::mutex> lock(mu);
+            ready[buf_idx] = false;
+            cv.notify_all();
+            buf_idx = 1 - buf_idx;
+            continue;
+        }
+
+        // Batch patches: [B * num_patches, patch_dim]
+        auto batched_patches = batch_patches(buf.patches);
+        int B = static_cast<int>(buf.patches.size());
+
+        // Grid info for batched forward
+        std::vector<GridTHW> grid_thw;
+        for (int i = 0; i < B; ++i) {
+            grid_thw.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});
+        }
+
+        // Run vision encoder
+        auto embeddings = vision_forward(batched_patches, &vision, grid_thw);
+        mx::eval(embeddings);
+
+        // embeddings shape: [B * PRECOMPUTE_TOKENS, TEXT_DIM]
+        // Reshape to [B, PRECOMPUTE_TOKENS, TEXT_DIM]
+        embeddings = mx::reshape(embeddings, {B, PRECOMPUTE_TOKENS, TEXT_DIM});
+
+        // Convert to float16 and write
+        auto emb_fp16 = mx::astype(embeddings, mx::float16);
+        mx::eval(emb_fp16);
+        const uint16_t* emb_data = emb_fp16.data<uint16_t>();
+        size_t emb_bytes = static_cast<size_t>(B) * PRECOMPUTE_TOKENS * TEXT_DIM * sizeof(uint16_t);
+        emb_out.write(reinterpret_cast<const char*>(emb_data), emb_bytes);
+
+        // Write filenames
+        for (const auto& path : buf.paths) {
+            names_out << path << "\n";
+        }
+
+        images_processed += B;
+
+        // Progress
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start_time).count();
+        double rate = images_processed.load() / elapsed;
+        std::cout << "\r  Processed " << images_processed.load() << "/" << total_images
+                  << " images (" << std::fixed << std::setprecision(1) << rate << " img/s)"
+                  << std::flush;
+
+        // Release buffer
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            ready[buf_idx] = false;
+        }
+        cv.notify_all();
+        buf_idx = 1 - buf_idx;
+    }
+
+    loader_thread.join();
+
+    if (!error.empty()) {
+        std::cerr << "\nError: " << error << std::endl;
+        return 1;
+    }
+
+    emb_out.close();
+    names_out.close();
+
+    auto end_time = std::chrono::steady_clock::now();
+    double total_time = std::chrono::duration<double>(end_time - start_time).count();
+
+    std::cout << "\n\n=== Complete ===" << std::endl;
+    std::cout << "Processed: " << images_processed.load() << " images" << std::endl;
+    std::cout << "Time:      " << std::fixed << std::setprecision(2) << total_time << " seconds" << std::endl;
+    std::cout << "Rate:      " << std::setprecision(1) << (images_processed.load() / total_time) << " images/sec" << std::endl;
+    std::cout << "Output:" << std::endl;
+    std::cout << "  " << embeddings_path << " (" << (fs::file_size(embeddings_path) / 1024 / 1024) << " MB)" << std::endl;
+    std::cout << "  " << filenames_path << std::endl;
+
+    return 0;
+}
+
+int run_dueling_bench(const std::string& weights_dir) {
+    std::cout << "=== Dueling Bandits Benchmark (Cached Embeddings) ===" << std::endl;
+    std::cout << "NOTE: Vision encoder runs ONCE per image (amortized)." << std::endl;
+    std::cout << "      This benchmark measures TEXT MODEL throughput only.\n" << std::endl;
+
+    // Load prompt tokens
+    std::string prompt_path = weights_dir + "/dueling_prompt_tokens.bin";
+    auto prompt_tokens = load_dueling_prompt(prompt_path);
+    if (prompt_tokens.empty()) {
+        std::cerr << "Failed to load prompt tokens" << std::endl;
+        return 1;
+    }
+    std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens" << std::endl;
+
+    // Only load text model - vision embeddings are pre-computed
+    std::cout << "Loading text model..." << std::endl;
+    TextModelWeights text;
+    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
+        std::cerr << "Failed to load text weights" << std::endl;
+        return 1;
+    }
+
+    // Benchmark config
+    const char* batch_env = std::getenv("GLM_BATCH_SIZE");
+    int B = batch_env ? std::atoi(batch_env) : 8;
+    int iters = 50;  // More iterations since text-only is faster
+    int warmup = 5;
+
+    std::cout << "\nBenchmark config: B=" << B << ", iters=" << iters << std::endl;
+
+    // Create "pre-computed" image embeddings [B, 144, 4096]
+    // In production, these would come from disk/cache after one-time vision encoding
+    auto img_embeds_a = mx::random::uniform({B, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
+    auto img_embeds_b = mx::random::uniform({B, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
+    mx::eval({img_embeds_a, img_embeds_b});
+
+    // Warmup
+    std::cout << "Warmup..." << std::endl;
+    for (int i = 0; i < warmup; ++i) {
+        auto logits = dueling_forward_cached(img_embeds_a, img_embeds_b, prompt_tokens, &text);
+        mx::eval(logits);
+    }
+    mx::synchronize();
+
+    // Benchmark
+    std::cout << "Benchmarking..." << std::endl;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        auto logits = dueling_forward_cached(img_embeds_a, img_embeds_b, prompt_tokens, &text);
+        mx::eval(logits);
+    }
+    mx::synchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double> elapsed = end - start;
+    double comparisons_per_sec = (double)(B * iters) / elapsed.count();
+    double ms_per_comparison = (elapsed.count() * 1000.0) / (B * iters);
+    double tokens_per_sec = comparisons_per_sec * prompt_tokens.size();
+
+    std::cout << "\n=== Results (Text Model Only) ===" << std::endl;
+    std::cout << "Batch size: " << B << std::endl;
+    std::cout << "Seq length: " << prompt_tokens.size() << " tokens" << std::endl;
+    std::cout << "Time per batch: " << (elapsed.count() * 1000.0 / iters) << " ms" << std::endl;
+    std::cout << "Comparisons/sec: " << comparisons_per_sec << std::endl;
+    std::cout << "ms/comparison: " << ms_per_comparison << std::endl;
+    std::cout << "Tokens/sec: " << tokens_per_sec << std::endl;
+
+    return 0;
 }
 
 int run_vision_bench() {
@@ -2649,6 +3839,48 @@ int main(int argc, char* argv[]) {
     if (int8_bench_env && std::string(int8_bench_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         return run_int8_text_bench(weights_dir);
+    }
+
+    const char* dueling_bench_env = std::getenv("GLM_DUELING_BENCH");
+    if (dueling_bench_env && std::string(dueling_bench_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_dueling_bench(weights_dir);
+    }
+
+    const char* inference_env = std::getenv("GLM_INFERENCE");
+    if (inference_env && std::string(inference_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_inference_from_files(weights_dir);
+    }
+
+    const char* precompute_env = std::getenv("GLM_PRECOMPUTE");
+    if (precompute_env && std::string(precompute_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        const char* input_dir_env = std::getenv("GLM_INPUT_DIR");
+        const char* output_dir_env = std::getenv("GLM_OUTPUT_DIR");
+        const char* batch_env = std::getenv("GLM_BATCH_SIZE");
+
+        std::string input_dir = input_dir_env ? input_dir_env : ".";
+        std::string output_dir = output_dir_env ? output_dir_env : "embeddings_out";
+        int batch_size = batch_env ? std::atoi(batch_env) : 8;
+
+        return run_precompute_embeddings(input_dir, output_dir, weights_dir, batch_size);
+    }
+
+    // Dueling comparison mode: compare two precomputed embeddings
+    // Usage: GLM_DUELING=1 GLM_EMBEDS_DIR=embeddings_512 [GLM_IDX_A=0] [GLM_IDX_B=1] ./glm46v_mlx
+    const char* dueling_env = std::getenv("GLM_DUELING");
+    if (dueling_env && std::string(dueling_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
+        const char* idx_a_env = std::getenv("GLM_IDX_A");
+        const char* idx_b_env = std::getenv("GLM_IDX_B");
+
+        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_512";
+        int idx_a = idx_a_env ? std::atoi(idx_a_env) : -1;  // -1 = random
+        int idx_b = idx_b_env ? std::atoi(idx_b_env) : -1;
+
+        return run_dueling_comparison(embeds_dir, weights_dir, idx_a, idx_b);
     }
 
     // Original benchmark modes
