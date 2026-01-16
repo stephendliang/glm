@@ -293,7 +293,7 @@ std::vector<std::string> list_images_recursive(const std::string& dir) {
 
 // Convert uint8 RGB image to float16 patches for vision encoder
 // Input: [H, W, 3] uint8 where H=W=target_size
-// Output: mx::array [num_patches, PATCH_INPUT_DIM] float16
+// Output: mx::array [num_patches, PATCH_INPUT_DIM] float32
 // Note: PATCH_INPUT_DIM = temporal_patch * patch_h * 3 * patch_w = 2 * 14 * 3 * 14 = 1176
 // Layout matches HuggingFace: after permute(0, 2, 4, 6, 3, 5, 1, 7) and view
 // Final order: [temporal, patch_h, channel, patch_w]
@@ -303,26 +303,11 @@ mx::array normalize_and_patchify(const std::vector<uint8_t>& pixels, int size, i
     int temporal_patch = 2;
     int patch_dim = temporal_patch * patch_size * 3 * patch_size;  // 1176
 
-    // Allocate float16 buffer
-    std::vector<uint16_t> patches_fp16(num_patches * patch_dim);
-
-    // Float16 conversion helper
-    auto to_fp16 = [](float val) -> uint16_t {
-        uint32_t f32;
-        std::memcpy(&f32, &val, 4);
-        uint32_t sign = (f32 >> 16) & 0x8000;
-        int32_t exp = ((f32 >> 23) & 0xFF) - 127 + 15;
-        uint32_t mant = (f32 >> 13) & 0x3FF;
-        if (exp <= 0) {
-            return static_cast<uint16_t>(sign);
-        } else if (exp >= 31) {
-            return static_cast<uint16_t>(sign | 0x7C00);
-        }
-        return static_cast<uint16_t>(sign | (exp << 10) | mant);
-    };
+    // Allocate float32 buffer (matching Python and verification test)
+    std::vector<float> patches_f32(num_patches * patch_dim);
 
     // Patchify: Layout is [temporal, patch_h, channel, patch_w]
-    // Normalization: rescale to [0,1] then apply mean/std (HuggingFace standard)
+    // Normalization: rescale to [0,1]
     for (int gh = 0; gh < grid; ++gh) {
         for (int gw = 0; gw < grid; ++gw) {
             int patch_idx = gh * grid + gw;
@@ -345,11 +330,7 @@ mx::array normalize_and_patchify(const std::vector<uint8_t>& pixels, int size, i
                                 pw;
 
                             // Normalize: rescale to [0,1]
-                            // Note: Uses simple [0,1] normalization to match verified test data.
-                            // Mean/std normalization (IMAGE_MEAN/IMAGE_STD) produces NaN with
-                            // these weights, indicating they were trained with [0,1] inputs.
-                            float val = pixels[src_idx] / 255.0f;
-                            patches_fp16[dst_idx] = to_fp16(val);
+                            patches_f32[dst_idx] = pixels[src_idx] / 255.0f;
                         }
                     }
                 }
@@ -357,7 +338,7 @@ mx::array normalize_and_patchify(const std::vector<uint8_t>& pixels, int size, i
         }
     }
 
-    return mx::array(patches_fp16.data(), {num_patches, patch_dim}, mx::float16);
+    return mx::array(patches_f32.data(), {num_patches, patch_dim}, mx::float32);
 }
 
 // Batch multiple images into single patches array
@@ -498,8 +479,10 @@ struct VisionPositionData {
     mx::array cos = empty_array();
     mx::array sin = empty_array();
     mx::array pos_embed_indices = empty_array();
-    mx::array image_type_h = empty_array();  // H coordinates for position embedding lookup
-    mx::array image_type_w = empty_array();  // W coordinates for position embedding lookup
+    mx::array image_type_h = empty_array();  // Scaled H coordinates (nearest-neighbor indices)
+    mx::array image_type_w = empty_array();  // Scaled W coordinates (nearest-neighbor indices)
+    mx::array raw_h_coords = empty_array();  // Raw H coordinates (0 to grid_h-1)
+    mx::array raw_w_coords = empty_array();  // Raw W coordinates (0 to grid_w-1)
     std::vector<int> seqlens;
     int total_seq = 0;
 };
@@ -1010,6 +993,8 @@ VisionPositionData build_vision_position_data(const std::vector<GridTHW>& grid_t
     data.pos_embed_indices = mx::array(pos_embed_indices.data(), {data.total_seq}, mx::int32);
     data.image_type_h = mx::array(image_type_h_vec.data(), {data.total_seq}, mx::int32);
     data.image_type_w = mx::array(image_type_w_vec.data(), {data.total_seq}, mx::int32);
+    data.raw_h_coords = h_coords_arr;  // Store raw coordinates for interpolation
+    data.raw_w_coords = w_coords_arr;
 
     int rotary_dim = HEAD_DIM / 2;
     auto inv_idx = mx::astype(mx::arange(0, rotary_dim, 2), mx::float32);
@@ -1495,9 +1480,141 @@ mx::array patch_embed_forward(mx::array patches, const VisionWeights* model) {
     return mx::reshape(x, {num_patches, VISION_DIM});
 }
 
+// Bilinear interpolation for position embeddings
+// This matches Python's F.grid_sample behavior for non-24x24 grids
+mx::array interpolate_position_embeddings(const mx::array& pos_embed_weight,
+                                          const mx::array& h_coords,
+                                          const mx::array& w_coords,
+                                          const mx::array& target_h,
+                                          const mx::array& target_w) {
+    // pos_embed_weight: [576, 1536] = [24*24, hidden_size]
+    // Reshape to [24, 24, hidden_size]
+    int orig_size = 24;  // sqrt(576)
+    int hidden_size = pos_embed_weight.shape(1);
+    auto pos_2d = mx::reshape(pos_embed_weight, {orig_size, orig_size, hidden_size});
+
+    // Match Python's grid_sample behavior:
+    // Python: norm = ((coord + 0.5) / target) * 2 - 1
+    // grid_sample with align_corners=False maps norm to pixel index:
+    //   pixel_idx = (norm + 1) / 2 * orig_size - 0.5
+    //             = ((coord + 0.5) / target) * orig_size - 0.5
+    auto h_f32 = mx::astype(h_coords, mx::float32);
+    auto w_f32 = mx::astype(w_coords, mx::float32);
+    auto th_f32 = mx::astype(target_h, mx::float32);
+    auto tw_f32 = mx::astype(target_w, mx::float32);
+
+    // Compute pixel positions in [0, orig_size-1] range (matching grid_sample)
+    auto h_pos = mx::subtract(
+        mx::multiply(mx::divide(mx::add(h_f32, mx::array(0.5f)), th_f32),
+                     mx::array(static_cast<float>(orig_size))),
+        mx::array(0.5f));
+    auto w_pos = mx::subtract(
+        mx::multiply(mx::divide(mx::add(w_f32, mx::array(0.5f)), tw_f32),
+                     mx::array(static_cast<float>(orig_size))),
+        mx::array(0.5f));
+
+    // Clamp to valid range
+    auto h_clamped = mx::clip(h_pos, mx::array(0.0f), mx::array(static_cast<float>(orig_size - 1 - 1e-5)));
+    auto w_clamped = mx::clip(w_pos, mx::array(0.0f), mx::array(static_cast<float>(orig_size - 1 - 1e-5)));
+
+    // Get integer indices for bilinear interpolation
+    auto h0 = mx::floor(h_clamped);
+    auto w0 = mx::floor(w_clamped);
+    auto h1 = mx::minimum(mx::add(h0, mx::array(1.0f)), mx::array(static_cast<float>(orig_size - 1)));
+    auto w1 = mx::minimum(mx::add(w0, mx::array(1.0f)), mx::array(static_cast<float>(orig_size - 1)));
+
+    // Compute interpolation weights
+    auto h_frac = mx::subtract(h_clamped, h0);
+    auto w_frac = mx::subtract(w_clamped, w0);
+
+    // Convert to int32 for indexing
+    auto h0_int = mx::astype(h0, mx::int32);
+    auto w0_int = mx::astype(w0, mx::int32);
+    auto h1_int = mx::astype(h1, mx::int32);
+    auto w1_int = mx::astype(w1, mx::int32);
+    mx::eval({h0_int, w0_int, h1_int, w1_int, h_frac, w_frac});
+
+    // Get the 4 corner values for each position
+    // Index into flattened pos_embed: idx = h * orig_size + w
+    auto idx00 = mx::add(mx::multiply(h0_int, mx::array(orig_size)), w0_int);
+    auto idx01 = mx::add(mx::multiply(h0_int, mx::array(orig_size)), w1_int);
+    auto idx10 = mx::add(mx::multiply(h1_int, mx::array(orig_size)), w0_int);
+    auto idx11 = mx::add(mx::multiply(h1_int, mx::array(orig_size)), w1_int);
+
+    auto v00 = mx::take(pos_embed_weight, idx00, 0);  // [N, hidden_size]
+    auto v01 = mx::take(pos_embed_weight, idx01, 0);
+    auto v10 = mx::take(pos_embed_weight, idx10, 0);
+    auto v11 = mx::take(pos_embed_weight, idx11, 0);
+
+    // Expand weights for broadcasting [N, 1]
+    auto h_w = mx::reshape(h_frac, {-1, 1});
+    auto w_w = mx::reshape(w_frac, {-1, 1});
+    auto one_minus_h = mx::subtract(mx::array(1.0f), h_w);
+    auto one_minus_w = mx::subtract(mx::array(1.0f), w_w);
+
+    // Bilinear interpolation
+    auto result = mx::add(
+        mx::add(
+            mx::multiply(mx::multiply(one_minus_h, one_minus_w), mx::astype(v00, mx::float32)),
+            mx::multiply(mx::multiply(one_minus_h, w_w), mx::astype(v01, mx::float32))
+        ),
+        mx::add(
+            mx::multiply(mx::multiply(h_w, one_minus_w), mx::astype(v10, mx::float32)),
+            mx::multiply(mx::multiply(h_w, w_w), mx::astype(v11, mx::float32))
+        )
+    );
+
+    return mx::astype(result, pos_embed_weight.dtype());
+}
+
 mx::array vision_embeddings_forward(mx::array x, const VisionWeights* model,
                                     const VisionPositionData& pos) {
-    auto pos_embed = mx::take(model->pos_embed_weight, pos.pos_embed_indices, 0);
+    // Check if we need interpolation (grid size != 24)
+    // For 24x24 grid, use simple lookup; for other sizes, use bilinear interpolation
+    bool needs_interpolation = false;
+    for (int i = 0; i < pos.seqlens.size(); ++i) {
+        int seq = pos.seqlens[i];
+        // 24x24 grid has 576 patches
+        if (seq != 576) {
+            needs_interpolation = true;
+            break;
+        }
+    }
+
+    if (!needs_interpolation) {
+        // Original fast path for 24x24 grid
+        auto pos_embed = mx::take(model->pos_embed_weight, pos.pos_embed_indices, 0);
+        return mx::add(x, pos_embed);
+    }
+
+    // Use bilinear interpolation for non-24x24 grids
+    // Build target_h and target_w arrays from seqlens
+    int total_seq = pos.image_type_h.shape(0);
+    std::vector<float> target_h_vec(total_seq);
+    std::vector<float> target_w_vec(total_seq);
+
+    int offset = 0;
+    for (size_t img_idx = 0; img_idx < pos.seqlens.size(); ++img_idx) {
+        int seq_len = pos.seqlens[img_idx];
+        // Infer grid size from seq_len (assuming t=1)
+        int grid_size = static_cast<int>(std::sqrt(seq_len));
+        for (int i = 0; i < seq_len; ++i) {
+            target_h_vec[offset + i] = static_cast<float>(grid_size);
+            target_w_vec[offset + i] = static_cast<float>(grid_size);
+        }
+        offset += seq_len;
+    }
+
+    auto target_h = mx::array(target_h_vec.data(), {total_seq}, mx::float32);
+    auto target_w = mx::array(target_w_vec.data(), {total_seq}, mx::float32);
+
+    auto pos_embed = interpolate_position_embeddings(
+        model->pos_embed_weight,
+        pos.raw_h_coords,  // Raw h coordinates (0 to grid_h-1)
+        pos.raw_w_coords,  // Raw w coordinates (0 to grid_w-1)
+        target_h,
+        target_w
+    );
     return mx::add(x, pos_embed);
 }
 
@@ -3075,6 +3192,103 @@ int run_vision_verify(const std::string& weights_dir) {
     }
 }
 
+// ==================== Vision Verification 448x448 ====================
+
+int run_vision_verify_448(const std::string& weights_dir) {
+    std::cout << "=== Vision Encoder Verification (448x448) ===" << std::endl;
+
+    // Use test_img100 patches for real-image verification
+    const char* use_img100 = std::getenv("GLM_USE_IMG100");
+    bool test_img100 = (use_img100 && std::string(use_img100) == "1");
+
+    // Paths
+    std::string raw_path = weights_dir + "/vision_encoder.bin";
+    std::string patches_path = test_img100 ?
+        weights_dir + "/test_img100_patches.bin" :
+        weights_dir + "/test_patches_448.bin";
+    std::string expected_path = test_img100 ?
+        weights_dir + "/expected_img100_output.bin" :
+        weights_dir + "/expected_output_448.bin";
+
+    // Load vision model weights
+    VisionWeights model;
+    if (!load_vision_weights(&model, raw_path)) {
+        std::cerr << "Failed to load vision weights" << std::endl;
+        return 1;
+    }
+
+    // For a 448x448 image with patch_size=14:
+    // grid_h=32, grid_w=32 -> 1024 patches
+    int num_patches = 1024;  // 32 * 32 * 1
+    int patch_dim = PATCH_INPUT_DIM;  // 1176
+
+    auto patches = load_binary_f32(patches_path, {num_patches, patch_dim});
+    if (patches.size() == 0) {
+        std::cerr << "Failed to load test patches" << std::endl;
+        return 1;
+    }
+    print_array_stats("\nInput patches", patches);
+
+    // Load expected output: 1024 / 4 = 256 tokens
+    int output_tokens = 256;
+    auto expected = load_binary_f32(expected_path, {output_tokens, MERGE_DIM});
+    if (expected.size() == 0) {
+        std::cerr << "Failed to load expected output" << std::endl;
+        return 1;
+    }
+    print_array_stats("Expected output", expected);
+
+    // Create grid_thw for single 448x448 image
+    std::vector<GridTHW> grid_thw = {{1, 32, 32}};  // t=1, h=32, w=32
+
+    // Run forward pass
+    std::cout << "\nRunning C++ forward pass..." << std::endl;
+    auto output = vision_forward(patches, &model, grid_thw);
+    mx::eval(output);
+    mx::synchronize();
+
+    print_array_stats("C++ output", output);
+
+    // Compare outputs
+    std::cout << "\n=== Comparison Results ===" << std::endl;
+
+    float max_diff = max_abs_diff(output, expected);
+    float mean_diff = mean_abs_diff(output, expected);
+
+    std::cout << "Max absolute difference: " << max_diff << std::endl;
+    std::cout << "Mean absolute difference: " << mean_diff << std::endl;
+
+    // Check within tolerance
+    const float tolerance = 0.015f;  // Slightly higher tolerance for larger grid
+    if (max_diff < tolerance) {
+        std::cout << "\n[PASS] Outputs match within tolerance (" << tolerance << ")" << std::endl;
+        return 0;
+    } else {
+        std::cout << "\n[FAIL] Outputs differ by more than tolerance (" << tolerance << ")" << std::endl;
+
+        // Debug: print first few values
+        std::cout << "\nFirst 10 output values comparison:" << std::endl;
+        auto out_f32 = mx::astype(output, mx::float32);
+        auto exp_f32 = mx::astype(expected, mx::float32);
+        mx::eval({out_f32, exp_f32});
+
+        auto out_flat = mx::reshape(out_f32, {-1});
+        auto exp_flat = mx::reshape(exp_f32, {-1});
+        mx::eval({out_flat, exp_flat});
+
+        const float* out_ptr = out_flat.data<float>();
+        const float* exp_ptr = exp_flat.data<float>();
+
+        std::cout << "  Index\tC++\t\tPython\t\tDiff" << std::endl;
+        for (int i = 0; i < 10; ++i) {
+            std::cout << "  " << i << "\t" << out_ptr[i] << "\t"
+                      << exp_ptr[i] << "\t" << std::abs(out_ptr[i] - exp_ptr[i]) << std::endl;
+        }
+
+        return 1;
+    }
+}
+
 // ==================== Text Model Verification ====================
 
 int run_text_verify(const std::string& weights_dir) {
@@ -3815,6 +4029,12 @@ int main(int argc, char* argv[]) {
     if (verify_text_env && std::string(verify_text_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         return run_text_verify(weights_dir);
+    }
+
+    const char* verify_448_env = std::getenv("GLM_VERIFY_448");
+    if (verify_448_env && std::string(verify_448_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        return run_vision_verify_448(weights_dir);
     }
 
     const char* verify_step_env = std::getenv("GLM_VERIFY_STEP");
