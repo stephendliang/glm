@@ -83,3 +83,20 @@ dueling: $(TARGET)
 	GLM_DUELING=1 GLM_EMBEDS_DIR=$(or $(EMBEDS),embeddings_512) \
 	GLM_IDX_A=$(or $(A),-1) GLM_IDX_B=$(or $(B),-1) \
 	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
+
+# Single-pair generation with KV cache
+# Usage: make generate [EMBEDS=embeddings_512] [A=idx] [B=idx] [TOKENS=100]
+generate: $(TARGET)
+	GLM_GENERATE=1 GLM_EMBEDS_DIR=$(or $(EMBEDS),embeddings_512) \
+	GLM_IDX_A=$(or $(A),-1) GLM_IDX_B=$(or $(B),-1) \
+	GLM_MAX_TOKENS=$(or $(TOKENS),100) \
+	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
+
+# Batched generation - process multiple pairs in parallel
+# Usage: make batch-generate [EMBEDS=embeddings_512] [BATCH=4] [TOKENS=100] [PAIRS=pairs.txt]
+# PAIRS file format: idx_a,idx_b per line (e.g., "0,1\n2,3\n...")
+batch-generate: $(TARGET)
+	GLM_BATCH_GENERATE=1 GLM_EMBEDS_DIR=$(or $(EMBEDS),embeddings_512) \
+	GLM_BATCH_SIZE=$(or $(BATCH),4) GLM_MAX_TOKENS=$(or $(TOKENS),100) \
+	$(if $(PAIRS),GLM_PAIRS_FILE=$(PAIRS)) \
+	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
