@@ -100,3 +100,12 @@ batch-generate: $(TARGET)
 	GLM_BATCH_SIZE=$(or $(BATCH),4) GLM_MAX_TOKENS=$(or $(TOKENS),100) \
 	$(if $(PAIRS),GLM_PAIRS_FILE=$(PAIRS)) \
 	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
+
+# Batched single-image description - process multiple images in parallel
+# Usage: make batch-single [EMBEDS=embeddings_out] [BATCH=64] [TOKENS=100] [INDICES=indices.txt]
+# INDICES file format: one index per line
+batch-single: $(TARGET)
+	GLM_BATCH_SINGLE_IMAGE=1 GLM_EMBEDS_DIR=$(or $(EMBEDS),embeddings_out) \
+	GLM_BATCH_SIZE=$(or $(BATCH),64) GLM_MAX_TOKENS=$(or $(TOKENS),100) \
+	$(if $(INDICES),GLM_INDICES_FILE=$(INDICES)) \
+	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)

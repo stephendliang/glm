@@ -5589,6 +5589,258 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Batched single-image description mode: process multiple images in parallel for annotation/description
+    // Usage: GLM_BATCH_SINGLE_IMAGE=1 GLM_EMBEDS_DIR=embeddings_out [GLM_BATCH_SIZE=64] [GLM_INDICES_FILE=indices.txt] [GLM_MAX_TOKENS=100] ./glm46v_mlx
+    // indices.txt format: one index per line
+    // Without indices file: uses first B images (or random if GLM_RANDOM_INDICES=1)
+    const char* batch_single_env = std::getenv("GLM_BATCH_SINGLE_IMAGE");
+    if (batch_single_env && std::string(batch_single_env) == "1") {
+        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
+        const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
+        const char* batch_size_env = std::getenv("GLM_BATCH_SIZE");
+        const char* indices_file_env = std::getenv("GLM_INDICES_FILE");
+        const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
+        const char* random_indices_env = std::getenv("GLM_RANDOM_INDICES");
+
+        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_out";
+        int batch_size = batch_size_env ? std::atoi(batch_size_env) : 64;
+        int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 100;
+        bool random_indices = random_indices_env && std::string(random_indices_env) == "1";
+
+        std::cout << "=== Batched Single-Image Description (448x448) ===" << std::endl;
+        std::cout << "Batch size: " << batch_size << std::endl;
+
+        // 1. Load filenames
+        std::string filenames_path = embeds_dir + "/filenames.txt";
+        std::ifstream filenames_file(filenames_path);
+        if (!filenames_file) {
+            std::cerr << "Failed to open " << filenames_path << std::endl;
+            return 1;
+        }
+        std::vector<std::string> filenames;
+        std::string line;
+        while (std::getline(filenames_file, line)) {
+            if (!line.empty()) filenames.push_back(line);
+        }
+        filenames_file.close();
+        int num_images = static_cast<int>(filenames.size());
+        std::cout << "Loaded " << num_images << " image filenames" << std::endl;
+
+        if (num_images == 0) {
+            std::cerr << "No images found in embeddings directory" << std::endl;
+            return 1;
+        }
+
+        // 2. Determine indices to process
+        std::vector<int> indices;
+        if (indices_file_env) {
+            // Load indices from file
+            std::ifstream indices_file(indices_file_env);
+            if (!indices_file) {
+                std::cerr << "Failed to open indices file: " << indices_file_env << std::endl;
+                return 1;
+            }
+            std::string idx_line;
+            while (std::getline(indices_file, idx_line) && static_cast<int>(indices.size()) < batch_size) {
+                if (!idx_line.empty()) {
+                    int idx = std::atoi(idx_line.c_str());
+                    if (idx >= 0 && idx < num_images) {
+                        indices.push_back(idx);
+                    }
+                }
+            }
+            indices_file.close();
+            std::cout << "Loaded " << indices.size() << " indices from " << indices_file_env << std::endl;
+        } else if (random_indices) {
+            // Generate random indices
+            std::srand(static_cast<unsigned>(std::time(nullptr)));
+            for (int i = 0; i < batch_size && i < num_images; ++i) {
+                indices.push_back(std::rand() % num_images);
+            }
+            std::cout << "Generated " << indices.size() << " random indices" << std::endl;
+        } else {
+            // Use first B images
+            for (int i = 0; i < batch_size && i < num_images; ++i) {
+                indices.push_back(i);
+            }
+            std::cout << "Using first " << indices.size() << " images" << std::endl;
+        }
+
+        int B = static_cast<int>(indices.size());
+        if (B == 0) {
+            std::cerr << "No valid indices to process" << std::endl;
+            return 1;
+        }
+        std::cout << "\nProcessing " << B << " images:" << std::endl;
+        for (int i = 0; i < std::min(B, 10); ++i) {
+            std::cout << "  [" << i << "] idx=" << indices[i] << " (" << filenames[indices[i]] << ")" << std::endl;
+        }
+        if (B > 10) {
+            std::cout << "  ... and " << (B - 10) << " more" << std::endl;
+        }
+
+        // 3. Load embeddings for all images
+        std::string embeds_path = embeds_dir + "/embeddings.bin";
+        std::ifstream embeds_file(embeds_path, std::ios::binary);
+        if (!embeds_file) {
+            std::cerr << "Failed to open " << embeds_path << std::endl;
+            return 1;
+        }
+
+        const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
+        const size_t bytes_per_image = tokens_per_image * TEXT_DIM * sizeof(uint16_t);
+
+        std::vector<std::vector<uint16_t>> embeds(B, std::vector<uint16_t>(tokens_per_image * TEXT_DIM));
+
+        for (int i = 0; i < B; ++i) {
+            embeds_file.seekg(indices[i] * bytes_per_image);
+            embeds_file.read(reinterpret_cast<char*>(embeds[i].data()), bytes_per_image);
+        }
+        embeds_file.close();
+        std::cout << "Loaded embeddings for " << B << " images" << std::endl;
+
+        // 4. Load single-image prompt tokens
+        std::string tokens_path = weights_dir + "/single_image_prompt_448.bin";
+        std::ifstream tokens_file(tokens_path, std::ios::binary);
+        if (!tokens_file) {
+            std::cerr << "Failed to open " << tokens_path << std::endl;
+            return 1;
+        }
+        tokens_file.seekg(0, std::ios::end);
+        int num_tokens = tokens_file.tellg() / sizeof(int32_t);
+        tokens_file.seekg(0, std::ios::beg);
+        std::vector<int32_t> prompt_tokens(num_tokens);
+        tokens_file.read(reinterpret_cast<char*>(prompt_tokens.data()), num_tokens * sizeof(int32_t));
+        tokens_file.close();
+        std::cout << "Loaded " << num_tokens << " prompt tokens (single-image)" << std::endl;
+
+        // 5. Load text model
+        std::cout << "Loading text model..." << std::endl;
+        TextModelWeights text;
+        if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
+            std::cerr << "Failed to load text weights" << std::endl;
+            return 1;
+        }
+
+        // 6. Build batched input embeddings
+        // Single image layout: [prefix:5][image:256][suffix:~9] = ~270 tokens
+        constexpr int IMAGE_START = 5;   // SINGLE_IMAGE_START_448
+        constexpr int IMAGE_END = 261;   // SINGLE_IMAGE_END_448
+
+        auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
+        auto base_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
+
+        // Pre-extract prefix and suffix (shared across batch)
+        auto prefix = mx::slice(base_embeds, {0, 0, 0}, {1, IMAGE_START, TEXT_DIM});
+        auto suffix = mx::slice(base_embeds, {0, IMAGE_END, 0}, {1, num_tokens, TEXT_DIM});
+
+        // Build batched sequences
+        std::vector<mx::array> batch_sequences;
+        for (int i = 0; i < B; ++i) {
+            auto img = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embeds[i].data()),
+                                 {1, tokens_per_image, TEXT_DIM}, mx::float16);
+
+            auto seq = mx::concatenate({prefix, img, suffix}, 1);  // [1, seq_len, dim]
+            batch_sequences.push_back(seq);
+        }
+
+        // Stack into batched tensor [B, seq_len, dim]
+        auto inputs_embeds = mx::concatenate(batch_sequences, 0);
+        int seq_len = inputs_embeds.shape(1);
+        std::cout << "Input embeddings shape: [" << B << ", " << seq_len << ", " << TEXT_DIM << "]" << std::endl;
+
+        // 7. Create batched position IDs
+        // Single image = 1 grid per batch element (not 2 like pairwise)
+        auto batched_input_ids = mx::broadcast_to(input_ids, {B, num_tokens});
+
+        std::vector<GridTHW> grids;
+        for (int i = 0; i < B; ++i) {
+            grids.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});  // One grid per image
+        }
+        auto rope = get_rope_index(batched_input_ids, grids, {}, empty_array());
+        auto position_ids = rope.position_ids;
+
+        std::cout << "Position IDs shape: [" << position_ids.shape(0) << ", "
+                  << position_ids.shape(1) << ", " << position_ids.shape(2) << "]" << std::endl;
+
+        // 8. Configure generation
+        GenerationConfig config;
+        config.max_new_tokens = max_tokens;
+
+        const char* do_sample_env = std::getenv("GLM_DO_SAMPLE");
+        if (do_sample_env) {
+            config.do_sample = std::string(do_sample_env) == "1";
+        }
+        const char* temp_env = std::getenv("GLM_TEMPERATURE");
+        if (temp_env) {
+            config.temperature = std::stof(temp_env);
+        }
+        const char* top_k_env = std::getenv("GLM_TOP_K");
+        if (top_k_env) {
+            config.top_k = std::atoi(top_k_env);
+        }
+        const char* top_p_env = std::getenv("GLM_TOP_P");
+        if (top_p_env) {
+            config.top_p = std::stof(top_p_env);
+        }
+        const char* rep_penalty_env = std::getenv("GLM_REP_PENALTY");
+        if (rep_penalty_env) {
+            config.repetition_penalty = std::stof(rep_penalty_env);
+        }
+        const char* seed_env = std::getenv("GLM_SEED");
+        if (seed_env) {
+            mx::random::seed(static_cast<uint64_t>(std::atoll(seed_env)));
+            std::cout << "Random seed: " << seed_env << std::endl;
+        }
+
+        std::cout << "\nSampling config: do_sample=" << (config.do_sample ? "true" : "false")
+                  << " temp=" << config.temperature
+                  << " top_k=" << config.top_k
+                  << " top_p=" << config.top_p
+                  << " rep_penalty=" << config.repetition_penalty << std::endl;
+
+        // 9. Batched generation
+        std::cout << "\nGenerating up to " << max_tokens << " tokens for " << B << " images..." << std::endl;
+
+        auto start = std::chrono::high_resolution_clock::now();
+        auto all_generated = generate_batched(inputs_embeds, &text, position_ids, config);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        int total_tokens = 0;
+        for (const auto& gen : all_generated) {
+            total_tokens += gen.size();
+        }
+        double tokens_per_sec = total_tokens / (ms / 1000.0);
+
+        std::cout << "\n=== Results ===" << std::endl;
+        std::cout << "Generated " << total_tokens << " total tokens in "
+                  << std::fixed << std::setprecision(1) << ms << " ms"
+                  << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
+
+        // Print results for each image
+        for (int i = 0; i < B; ++i) {
+            std::cout << "\n--- Image " << i << " (idx=" << indices[i] << ": " << filenames[indices[i]] << ") ---" << std::endl;
+            std::cout << "Generated " << all_generated[i].size() << " tokens" << std::endl;
+            std::cout << "Token IDs: ";
+            for (size_t j = 0; j < all_generated[i].size(); ++j) {
+                std::cout << all_generated[i][j];
+                if (j < all_generated[i].size() - 1) std::cout << " ";
+            }
+            std::cout << std::endl;
+
+            // Simple token analysis
+            for (size_t j = 0; j < all_generated[i].size(); ++j) {
+                int32_t tok = all_generated[i][j];
+                if (tok == 151329) std::cout << "  [" << j << "] EOS" << std::endl;
+                else if (tok >= 65 && tok <= 90) std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
+                else if (tok >= 97 && tok <= 122) std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
+            }
+        }
+
+        return 0;
+    }
+
     // Original benchmark modes
     bool run_text = (GLM_RUN_TEXT != 0);
     const char* run_text_env = std::getenv("GLM_RUN_TEXT");
