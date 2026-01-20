@@ -18,6 +18,7 @@
 #include <atomic>
 #include <filesystem>
 #include <array>
+#include <functional>
 #include <turbojpeg.h>
 
 // --- Compile-Time Constraints (GLM-4.6V vision) ---
@@ -86,34 +87,89 @@
 #define GLM_RUN_TEXT 0
 #endif
 
-// --- Dueling Bandits Config (for 336x336 images) ---
-// Image tokens: grid=24x24, merge=2x2 -> 144 tokens per image
-#define DUELING_NUM_IMAGE_TOKENS 144
-#define DUELING_PROMPT_LEN 313
-#define DUELING_IMAGE_A_START 5
-#define DUELING_IMAGE_A_END 149
-#define DUELING_IMAGE_B_START 151
-#define DUELING_IMAGE_B_END 295
-
-// --- Precompute Config (for 448x448 images) ---
-// Higher resolution for better visual detail
+// --- Legacy Compile-Time Constants (now runtime via GLM_IMAGE_SIZE) ---
+// These defines are kept as documentation for reference values.
+// All values are now computed at runtime from GLM_IMAGE_SIZE env var.
+//
+// --- For 336x336 images ---
+// grid=24x24, merge=2x2 -> 144 tokens per image
+// #define DUELING_NUM_IMAGE_TOKENS 144
+// #define DUELING_PROMPT_LEN 313
+// #define DUELING_IMAGE_A_START 5
+// #define DUELING_IMAGE_A_END 149
+// #define DUELING_IMAGE_B_START 151
+// #define DUELING_IMAGE_B_END 295
+//
+// --- For 448x448 images ---
 // grid=32x32, merge=2x2 -> 256 tokens per image
-#define PRECOMPUTE_SIZE 448
-#define PRECOMPUTE_PATCH 14
-#define PRECOMPUTE_GRID 32
-#define PRECOMPUTE_TOKENS 256
-
-// --- Dueling Config for 448x448 (from dueling_prompt_config_448.h) ---
-#define DUELING_PROMPT_LEN_448 541
-#define DUELING_IMAGE_A_START_448 5
-#define DUELING_IMAGE_A_END_448 261
-#define DUELING_IMAGE_B_START_448 263
-#define DUELING_IMAGE_B_END_448 519
-#define DUELING_NUM_IMAGE_TOKENS_448 256
-#define PRECOMPUTE_PATCH_DIM (3 * PRECOMPUTE_PATCH * PRECOMPUTE_PATCH)
+// #define PRECOMPUTE_SIZE 448
+// #define PRECOMPUTE_PATCH 14
+// #define PRECOMPUTE_GRID 32
+// #define PRECOMPUTE_TOKENS 256
+// #define DUELING_PROMPT_LEN_448 541
+// #define DUELING_IMAGE_A_START_448 5
+// #define DUELING_IMAGE_A_END_448 261
+// #define DUELING_IMAGE_B_START_448 263
+// #define DUELING_IMAGE_B_END_448 519
+// #define DUELING_NUM_IMAGE_TOKENS_448 256
+// #define PRECOMPUTE_PATCH_DIM (3 * PRECOMPUTE_PATCH * PRECOMPUTE_PATCH)
 
 namespace mx = mlx::core;
 namespace fs = std::filesystem;
+
+// --- Runtime Image Configuration ---
+// All image-related dimensions are derived from GLM_IMAGE_SIZE env var.
+// Formulas:
+//   grid = image_size / 14 (patch size is always 14)
+//   tokens_per_image = (grid / 2)^2 (2x2 spatial merge)
+//   patch_dim = 3 * 14 * 14 = 588
+struct ImageConfig {
+    int image_size;
+    int grid;
+    int tokens_per_image;
+    int patch_dim;
+
+    // Single-image offsets
+    int image_start;
+    int image_end;
+
+    // Dual-image offsets
+    int image_a_start;
+    int image_a_end;
+    int image_b_start;
+    int image_b_end;
+
+    static ImageConfig from_size(int size) {
+        ImageConfig c;
+        c.image_size = size;
+        c.grid = size / 14;  // PATCH_SIZE = 14
+        c.tokens_per_image = (c.grid / 2) * (c.grid / 2);  // 2x2 spatial merge
+        c.patch_dim = 3 * 14 * 14;  // 588
+
+        c.image_start = 5;  // Fixed prompt structure
+        c.image_end = 5 + c.tokens_per_image;
+
+        c.image_a_start = 5;
+        c.image_a_end = 5 + c.tokens_per_image;
+        c.image_b_start = c.image_a_end + 2;  // 2 separator tokens
+        c.image_b_end = c.image_b_start + c.tokens_per_image;
+
+        return c;
+    }
+
+    void print() const {
+        std::cout << "ImageConfig: size=" << image_size
+                  << " grid=" << grid
+                  << " tokens=" << tokens_per_image
+                  << " patch_dim=" << patch_dim << std::endl;
+        std::cout << "  Single: start=" << image_start << " end=" << image_end << std::endl;
+        std::cout << "  Dual: A=[" << image_a_start << "," << image_a_end << ")"
+                  << " B=[" << image_b_start << "," << image_b_end << ")" << std::endl;
+    }
+};
+
+// Global image config - initialized in main()
+static ImageConfig g_img_cfg;
 
 mx::array empty_array() { return mx::array({}); }
 
@@ -435,43 +491,6 @@ struct TextModelWeights {
     LinearWeights lm_head;  // Added: language model head for logits
 
     TextModelWeights() : layers(TEXT_NUM_LAYERS) {}
-};
-
-// INT8 quantized weight structures (for text encoder only)
-struct QuantizedLinearWeights {
-    mx::array weight = empty_array();  // int8 [in, out]
-    mx::array scales = empty_array();  // float16 [out] per-channel scales
-    mx::array bias = empty_array();    // float16 [out] or empty
-};
-
-struct QuantizedTextAttentionWeights {
-    QuantizedLinearWeights q_proj;
-    QuantizedLinearWeights k_proj;
-    QuantizedLinearWeights v_proj;
-    QuantizedLinearWeights o_proj;
-};
-
-struct QuantizedTextMLPWeights {
-    QuantizedLinearWeights gate_up_proj;
-    QuantizedLinearWeights down_proj;
-};
-
-struct QuantizedTextLayerWeights {
-    RMSNormWeights input_layernorm;           // Keep in FP16
-    RMSNormWeights post_self_attn_layernorm;  // Keep in FP16
-    RMSNormWeights post_attention_layernorm;  // Keep in FP16
-    RMSNormWeights post_mlp_layernorm;        // Keep in FP16
-    QuantizedTextAttentionWeights self_attn;
-    QuantizedTextMLPWeights mlp;
-};
-
-struct QuantizedTextModelWeights {
-    mx::array embed_tokens = empty_array();  // Keep embeddings in FP16
-    std::vector<QuantizedTextLayerWeights> layers;
-    RMSNormWeights norm;                     // Keep in FP16
-    QuantizedLinearWeights lm_head;
-
-    QuantizedTextModelWeights() : layers(TEXT_NUM_LAYERS) {}
 };
 
 // === KV Cache Structures for Multi-Token Generation ===
@@ -820,95 +839,6 @@ bool load_text_weights(TextModelWeights* model, const std::string& path) {
     return true;
 }
 
-// Load INT8 quantized text weights
-// Format: FP16 for embeddings/norms, INT8 weights + FP16 scales for linear layers
-bool load_quantized_text_weights(QuantizedTextModelWeights* model, const std::string& path) {
-    std::cout << "Loading INT8 quantized text weights from: " << path << std::endl;
-
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cerr << "Error: Cannot open file: " << path << std::endl;
-        return false;
-    }
-
-    size_t file_size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> buffer(file_size);
-    if (!file.read(reinterpret_cast<char*>(buffer.data()), file_size)) {
-        std::cerr << "Error: Failed to read file: " << path << std::endl;
-        return false;
-    }
-
-    const uint8_t* ptr = buffer.data();
-
-    // Helper to read FP16 array
-    auto read_fp16 = [&ptr](const mx::Shape& shape) -> mx::array {
-        size_t count = 1;
-        for (auto d : shape) count *= d;
-        mx::array arr(reinterpret_cast<const mlx::core::float16_t*>(ptr), shape, mx::float16);
-        ptr += count * sizeof(uint16_t);
-        return arr;
-    };
-
-    // Helper to read INT8 array
-    auto read_int8 = [&ptr](const mx::Shape& shape) -> mx::array {
-        size_t count = 1;
-        for (auto d : shape) count *= d;
-        mx::array arr(reinterpret_cast<const int8_t*>(ptr), shape, mx::int8);
-        ptr += count * sizeof(int8_t);
-        return arr;
-    };
-
-    // Helper to read quantized linear weights (INT8 weight + FP16 scale + optional FP16 bias)
-    auto read_quant_linear = [&](QuantizedLinearWeights* w, int in_dim, int out_dim, bool has_bias) {
-        w->weight = read_int8({in_dim, out_dim});
-        w->scales = read_fp16({out_dim});
-        if (has_bias) {
-            w->bias = read_fp16({out_dim});
-        }
-    };
-
-    // 1. embed_tokens [vocab_size, dim] - keep in FP16
-    model->embed_tokens = read_fp16({TEXT_VOCAB_SIZE, TEXT_DIM});
-
-    // 2. Transformer layers
-    for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
-        auto& layer = model->layers[i];
-
-        // Layer norms stay in FP16
-        layer.input_layernorm.weight = read_fp16({TEXT_DIM});
-        layer.post_self_attn_layernorm.weight = read_fp16({TEXT_DIM});
-        layer.post_attention_layernorm.weight = read_fp16({TEXT_DIM});
-        layer.post_mlp_layernorm.weight = read_fp16({TEXT_DIM});
-
-        // Attention projections - INT8 quantized
-        read_quant_linear(&layer.self_attn.q_proj, TEXT_DIM, TEXT_DIM, true);
-        read_quant_linear(&layer.self_attn.k_proj, TEXT_DIM, TEXT_KV_DIM, true);
-        read_quant_linear(&layer.self_attn.v_proj, TEXT_DIM, TEXT_KV_DIM, true);
-        read_quant_linear(&layer.self_attn.o_proj, TEXT_DIM, TEXT_DIM, false);
-
-        // MLP - INT8 quantized
-        read_quant_linear(&layer.mlp.gate_up_proj, TEXT_DIM, TEXT_GATE_UP_DIM, false);
-        read_quant_linear(&layer.mlp.down_proj, TEXT_MLP_DIM, TEXT_DIM, false);
-    }
-
-    // 3. Final norm - FP16
-    model->norm.weight = read_fp16({TEXT_DIM});
-
-    // 4. LM head - INT8 quantized
-    read_quant_linear(&model->lm_head, TEXT_DIM, TEXT_VOCAB_SIZE, false);
-
-    size_t bytes_read = ptr - buffer.data();
-    if (bytes_read != buffer.size()) {
-        std::cerr << "Warning: Read " << bytes_read << " bytes, buffer has " << buffer.size() << std::endl;
-    }
-
-    std::cout << "INT8 quantized text weights loaded successfully!" << std::endl;
-    std::cout << "  File size: " << file_size / 1024 / 1024 << " MB (INT8 + FP16 scales)" << std::endl;
-    return true;
-}
-
 // Load binary float32 array from file
 mx::array load_binary_f32(const std::string& path, const mx::Shape& shape) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -959,45 +889,11 @@ float mean_abs_diff(const mx::array& a, const mx::array& b) {
     return mean_diff.item<float>();
 }
 
-// Print array statistics for debugging
-void print_array_stats(const std::string& name, const mx::array& arr) {
-    auto arr_f32 = mx::astype(arr, mx::float32);
-    auto min_val = mx::min(arr_f32);
-    auto max_val = mx::max(arr_f32);
-    auto mean_val = mx::mean(arr_f32);
-    mx::eval({min_val, max_val, mean_val});
-
-    std::cout << name << ": shape=[";
-    for (size_t i = 0; i < arr.shape().size(); ++i) {
-        if (i > 0) std::cout << ", ";
-        std::cout << arr.shape()[i];
-    }
-    std::cout << "], min=" << min_val.item<float>()
-              << ", max=" << max_val.item<float>()
-              << ", mean=" << mean_val.item<float>() << std::endl;
-}
-
 mx::array fast_linear(mx::array x, const LinearWeights* w) {
     if (w->bias.size() == 0) {
         return mx::matmul(x, w->weight);
     }
     return mx::addmm(w->bias, x, w->weight);
-}
-
-// INT8 quantized linear: dequantize on-the-fly and compute
-// weight: int8 [in, out], scales: fp16 [out]
-// Dequantized = weight * scales (broadcast over in dimension)
-mx::array quantized_linear(mx::array x, const QuantizedLinearWeights* w) {
-    // Dequantize: cast int8 to fp16, multiply by scales
-    // weight is [in, out], scales is [out]
-    auto weight_f16 = mx::astype(w->weight, mx::float16);
-    auto scales_bc = mx::reshape(w->scales, {1, w->scales.shape(0)});  // [1, out]
-    auto dequant = mx::multiply(weight_f16, scales_bc);  // [in, out]
-
-    if (w->bias.size() == 0) {
-        return mx::matmul(x, dequant);
-    }
-    return mx::addmm(w->bias, x, dequant);
 }
 
 mx::array rms_norm(mx::array x, const RMSNormWeights* w, float eps = 1e-5f) {
@@ -1413,43 +1309,11 @@ mx::array text_model_forward_embeds(mx::array inputs_embeds, const TextModelWeig
     auto position_embeddings = text_rotary_embeddings(inputs_embeds, pos_ids);
     auto x = inputs_embeds;
 
-    // Debug: Check input and early layer stats
-    static bool debug_printed = false;
-    const char* debug_env = std::getenv("GLM_DEBUG_LAYERS");
-    bool do_debug = debug_env && std::string(debug_env) == "1" && !debug_printed;
-
-    if (do_debug) {
-        mx::eval(x);
-        auto x_f32 = mx::astype(x, mx::float32);
-        auto x_mean = mx::mean(mx::abs(x_f32));
-        mx::eval(x_mean);
-        std::cout << "  [Layer input] mean |x|: " << x_mean.item<float>() << std::endl;
-    }
-
     for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
         x = text_layer_forward(x, &model->layers[i], position_embeddings, attention_mask);
-        if (do_debug && (i == 0 || i == 5 || i == 39)) {
-            mx::eval(x);
-            auto x_f32 = mx::astype(x, mx::float32);
-            auto x_mean = mx::mean(mx::abs(x_f32));
-            mx::eval(x_mean);
-            std::cout << "  [After layer " << i << "] mean |x|: " << x_mean.item<float>() << std::endl;
-        }
     }
 
-    if (do_debug) debug_printed = true;
-
-    auto out = rms_norm(x, &model->norm, TEXT_RMS_EPS);
-
-    if (do_debug) {
-        mx::eval(out);
-        auto out_f32 = mx::astype(out, mx::float32);
-        auto out_mean = mx::mean(mx::abs(out_f32));
-        mx::eval(out_mean);
-        std::cout << "  [After final norm] mean |x|: " << out_mean.item<float>() << std::endl;
-    }
-
-    return out;
+    return rms_norm(x, &model->norm, TEXT_RMS_EPS);
 }
 
 mx::array text_model_forward_ids(mx::array input_ids, const TextModelWeights* model,
@@ -1784,9 +1648,6 @@ std::vector<int32_t> generate(
     generated.push_back(next_token);
 
     // === DECODE: Generate one token at a time using cache ===
-    const char* debug_gen = std::getenv("GLM_DEBUG_GEN");
-    bool do_debug_gen = debug_gen && std::string(debug_gen) == "1";
-
     for (int step = 0; step < config.max_new_tokens - 1; ++step) {
         // Check if token is any of the EOS tokens
         bool is_eos = false;
@@ -1807,38 +1668,13 @@ std::vector<int32_t> generate(
         // Position for this decode step - use actual position value, not cache token count
         auto decode_pos = make_decode_position_ids(next_position, 1);
 
-        if (do_debug_gen && step < 3) {
-            std::cout << "  [step " << step << "] pos=" << next_position
-                      << " input_token=" << next_token << std::endl;
-            mx::eval(new_embed);
-            auto emb_f32 = mx::astype(new_embed, mx::float32);
-            auto emb_mean = mx::mean(mx::abs(emb_f32));
-            mx::eval(emb_mean);
-            std::cout << "    embed mean |x|: " << emb_mean.item<float>() << std::endl;
-        }
-
         // Forward with cache (only processes the new token)
         hidden = text_model_forward_embeds_cached(new_embed, model, decode_pos, cache);
         next_position++;  // Increment position for next decode step
 
-        if (do_debug_gen && step < 3) {
-            mx::eval(hidden);
-            auto h_f32 = mx::astype(hidden, mx::float32);
-            auto h_mean = mx::mean(mx::abs(h_f32));
-            mx::eval(h_mean);
-            std::cout << "    hidden mean |x|: " << h_mean.item<float>() << std::endl;
-        }
-
         // Get logits and sample
         logits = compute_logits(hidden, model);
         mx::eval(logits);
-
-        if (do_debug_gen && step < 3) {
-            auto logits_f32 = mx::astype(logits, mx::float32);
-            auto top_idx = mx::argmax(logits_f32, -1);
-            mx::eval(top_idx);
-            std::cout << "    top logit idx: " << top_idx.item<int32_t>() << std::endl;
-        }
 
         next_token = sample_token(logits, config, generated);
         generated.push_back(next_token);
@@ -1939,17 +1775,9 @@ std::vector<std::vector<int32_t>> generate_batched(
     }
 
     // === DECODE: Generate all B sequences in parallel ===
-    const char* debug_gen = std::getenv("GLM_DEBUG_BATCH_GEN");
-    bool do_debug_gen = debug_gen && std::string(debug_gen) == "1";
-
     for (int step = 0; step < config.max_new_tokens - 1; ++step) {
         // Check if all sequences are done
         if (cache.all_finished()) break;
-
-        if (do_debug_gen && step < 3) {
-            std::cout << "  [batch step " << step << "] finished=" << cache.num_finished()
-                      << "/" << B << std::endl;
-        }
 
         // Get embeddings for B tokens
         // next_tokens is [B], we need to look up embeddings
@@ -1993,101 +1821,6 @@ std::vector<std::vector<int32_t>> generate_batched(
     }
 
     return generated;
-}
-
-// ==================== INT8 Quantized Text Model Forward ====================
-
-mx::array quantized_text_attention_forward(mx::array x, const QuantizedTextAttentionWeights* w,
-                                           const std::pair<mx::array, mx::array>& position_embeddings,
-                                           const mx::array& attention_mask) {
-    int B = x.shape(0);
-    int T = x.shape(1);
-
-    auto q = quantized_linear(x, &w->q_proj);
-    auto k = quantized_linear(x, &w->k_proj);
-    auto v = quantized_linear(x, &w->v_proj);
-
-    auto q_rs = mx::reshape(q, {B, T, TEXT_NUM_HEADS, TEXT_HEAD_DIM});
-    auto k_rs = mx::reshape(k, {B, T, TEXT_KV_HEADS, TEXT_HEAD_DIM});
-    auto v_rs = mx::reshape(v, {B, T, TEXT_KV_HEADS, TEXT_HEAD_DIM});
-
-    q_rs = mx::transpose(q_rs, {0, 2, 1, 3});
-    k_rs = mx::transpose(k_rs, {0, 2, 1, 3});
-    v_rs = mx::transpose(v_rs, {0, 2, 1, 3});
-
-    auto rotated = apply_multimodal_rotary_pos_emb(q_rs, k_rs, position_embeddings.first, position_embeddings.second);
-    q_rs = rotated.first;
-    k_rs = rotated.second;
-
-    const int kv_repeat = TEXT_NUM_HEADS / TEXT_KV_HEADS;
-    k_rs = repeat_kv(k_rs, kv_repeat);
-    v_rs = repeat_kv(v_rs, kv_repeat);
-
-    float scale = 1.0f / std::sqrt((float)TEXT_HEAD_DIM);
-    std::optional<mx::array> mask_opt;
-    if (attention_mask.size() != 0) {
-        auto mask_f = mx::astype(attention_mask, mx::float32);
-        auto inv_mask = mx::subtract(mx::array(1.0f), mask_f);
-        auto neg_inf = mx::array(-1e9f);
-        auto add_mask = mx::multiply(inv_mask, neg_inf);
-        add_mask = mx::reshape(add_mask, {B, 1, 1, T});
-        mask_opt = add_mask;
-    }
-    auto out = mx::fast::scaled_dot_product_attention(q_rs, k_rs, v_rs, scale, "causal", mask_opt);
-    out = mx::transpose(out, {0, 2, 1, 3});
-    out = mx::reshape(out, {B, T, TEXT_DIM});
-    return quantized_linear(out, &w->o_proj);
-}
-
-mx::array quantized_text_mlp_forward(mx::array x, const QuantizedTextMLPWeights* w) {
-    auto gate_up = quantized_linear(x, &w->gate_up_proj);
-    auto gate_up_split = mx::split(gate_up, 2, 2);
-    auto gate = silu(gate_up_split[0]);
-    auto up = gate_up_split[1];
-    return quantized_linear(mx::multiply(gate, up), &w->down_proj);
-}
-
-mx::array quantized_text_layer_forward(mx::array x, const QuantizedTextLayerWeights* w,
-                                       const std::pair<mx::array, mx::array>& position_embeddings,
-                                       const mx::array& attention_mask) {
-    // GLM-4V uses 4 layer norms per layer
-    auto residual = x;
-    x = rms_norm(x, &w->input_layernorm, TEXT_RMS_EPS);
-    x = quantized_text_attention_forward(x, &w->self_attn, position_embeddings, attention_mask);
-    x = rms_norm(x, &w->post_self_attn_layernorm, TEXT_RMS_EPS);
-    x = mx::add(residual, x);
-
-    residual = x;
-    x = rms_norm(x, &w->post_attention_layernorm, TEXT_RMS_EPS);
-    x = quantized_text_mlp_forward(x, &w->mlp);
-    x = rms_norm(x, &w->post_mlp_layernorm, TEXT_RMS_EPS);
-    return mx::add(residual, x);
-}
-
-mx::array quantized_text_model_forward_embeds(mx::array inputs_embeds, const QuantizedTextModelWeights* model,
-                                              const mx::array& position_ids, const mx::array& attention_mask) {
-    auto pos_emb = text_rotary_embeddings(inputs_embeds, position_ids);
-    auto x = inputs_embeds;
-    for (int i = 0; i < TEXT_NUM_LAYERS; ++i) {
-        x = quantized_text_layer_forward(x, &model->layers[i], pos_emb, attention_mask);
-    }
-    return rms_norm(x, &model->norm, TEXT_RMS_EPS);
-}
-
-mx::array quantized_text_model_forward_ids(mx::array input_ids, const QuantizedTextModelWeights* model,
-                                           const mx::array& position_ids, const mx::array& attention_mask) {
-    auto embeds = mx::take(model->embed_tokens, input_ids, 0);
-    return quantized_text_model_forward_embeds(embeds, model, position_ids, attention_mask);
-}
-
-mx::array quantized_compute_logits(const mx::array& hidden_states, const QuantizedTextModelWeights* model) {
-    return quantized_linear(hidden_states, &model->lm_head);
-}
-
-mx::array quantized_text_model_forward_with_logits(mx::array input_ids, const QuantizedTextModelWeights* model,
-                                                   const mx::array& position_ids, const mx::array& attention_mask) {
-    auto hidden_states = quantized_text_model_forward_ids(input_ids, model, position_ids, attention_mask);
-    return quantized_compute_logits(hidden_states, model);
 }
 
 mx::array vision_mlp_forward(mx::array x, const MLPWeights* w) {
@@ -2317,70 +2050,17 @@ mx::array vision_embeddings_forward(mx::array x, const VisionWeights* model,
 
 mx::array vision_forward(mx::array patches, const VisionWeights* model,
                          const std::vector<GridTHW>& grid_thw) {
-    static bool debug = std::getenv("GLM_DEBUG_VISION") != nullptr;
-
     auto pos = build_vision_position_data(grid_thw);
     auto x = patch_embed_forward(patches, model);
 
-    if (debug) {
-        mx::eval(x);
-        auto x_f32 = mx::astype(x, mx::float32);
-        mx::eval(x_f32);
-        std::cout << "After patch_embed: shape=[" << x.shape(0) << ", " << x.shape(1) << "]" << std::endl;
-        std::cout << "  Mean: " << mx::mean(x_f32).item<float>() << std::endl;
-        std::cout << "  Std: " << mx::std(x_f32, false).item<float>() << std::endl;
-        // Save first 10 values of patch 0
-        const float* data = x_f32.data<float>();
-        std::cout << "  First 10 values of patch 0: ";
-        for (int i = 0; i < 10; ++i) std::cout << data[i] << " ";
-        std::cout << std::endl;
-        // Save patch 512
-        const float* data512 = x_f32.data<float>() + 512 * x.shape(1);
-        std::cout << "  First 10 values of patch 512: ";
-        for (int i = 0; i < 10; ++i) std::cout << data512[i] << " ";
-        std::cout << std::endl;
-    }
-
     x = rms_norm(x, &model->post_conv_layernorm, VISION_RMS_EPS);
-
-    if (debug) {
-        mx::eval(x);
-        auto x_f32 = mx::astype(x, mx::float32);
-        mx::eval(x_f32);
-        std::cout << "After post_conv_layernorm: mean=" << mx::mean(x_f32).item<float>()
-                  << " std=" << mx::std(x_f32, false).item<float>() << std::endl;
-    }
-
     x = vision_embeddings_forward(x, model, pos);
-
-    if (debug) {
-        mx::eval(x);
-        auto x_f32 = mx::astype(x, mx::float32);
-        mx::eval(x_f32);
-        std::cout << "After vision_embeddings: mean=" << mx::mean(x_f32).item<float>()
-                  << " std=" << mx::std(x_f32, false).item<float>() << std::endl;
-    }
 
     for (int i = 0; i < NUM_LAYERS; ++i) {
         x = vision_block_forward(x, &model->blocks[i], pos);
-        if (debug && (i == 0 || i == NUM_LAYERS - 1)) {
-            mx::eval(x);
-            auto x_f32 = mx::astype(x, mx::float32);
-            mx::eval(x_f32);
-            std::cout << "After vision_block[" << i << "]: mean=" << mx::mean(x_f32).item<float>()
-                      << " std=" << mx::std(x_f32, false).item<float>() << std::endl;
-        }
     }
 
     x = rms_norm(x, &model->post_layernorm, VISION_RMS_EPS);
-
-    if (debug) {
-        mx::eval(x);
-        auto x_f32 = mx::astype(x, mx::float32);
-        mx::eval(x_f32);
-        std::cout << "After post_layernorm: mean=" << mx::mean(x_f32).item<float>()
-                  << " std=" << mx::std(x_f32, false).item<float>() << std::endl;
-    }
 
     // Reshape for spatial merge: [total_tokens, dim] -> [merge_groups, 2, 2, dim]
     // Each group of SPATIAL_MERGE_SIZE^2 tokens gets merged into one
@@ -2399,6 +2079,16 @@ mx::array vision_forward(mx::array patches, const VisionWeights* model,
     x = mx::reshape(x, {merge_tokens, MERGE_DIM});
 
     return merger_forward(x, &model->merger);
+}
+
+// Compiled vision forward - captures model and grid_thw, returns compiled closure
+// Lambda signature: (const std::vector<mx::array>&) -> std::vector<mx::array>
+std::function<std::vector<mx::array>(const std::vector<mx::array>&)>
+make_compiled_vision_forward(const VisionWeights* model, const std::vector<GridTHW>& grid_thw) {
+    return mx::compile([model, grid_thw](const std::vector<mx::array>& inputs) {
+        auto out = vision_forward(inputs[0], model, grid_thw);
+        return std::vector<mx::array>{out};
+    });
 }
 
 struct PatchifyResult {
@@ -2870,8 +2560,8 @@ mx::array batch_dueling_forward(
     auto img_feats_a = vision_forward(flat_a, vision, grids_a);  // [B*144, 4096]
     auto img_feats_b = vision_forward(flat_b, vision, grids_b);  // [B*144, 4096]
 
-    // Reshape to [B, 144, 4096]
-    int tokens_per_img = DUELING_NUM_IMAGE_TOKENS;
+    // Reshape to [B, tokens_per_image, TEXT_DIM]
+    int tokens_per_img = g_img_cfg.tokens_per_image;
     img_feats_a = mx::reshape(img_feats_a, {B, tokens_per_img, TEXT_DIM});
     img_feats_b = mx::reshape(img_feats_b, {B, tokens_per_img, TEXT_DIM});
 
@@ -2883,9 +2573,9 @@ mx::array batch_dueling_forward(
     // img_b:  tokens[IMAGE_B_START:IMAGE_B_END] -> replace with feats_b
     // suffix: tokens[IMAGE_B_END:end]
 
-    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, DUELING_IMAGE_A_START, TEXT_DIM});
-    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END, 0}, {B, DUELING_IMAGE_B_START, TEXT_DIM});
-    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END, 0}, {B, seq_len, TEXT_DIM});
+    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, g_img_cfg.image_a_start, TEXT_DIM});
+    auto mid = mx::slice(inputs_embeds, {0, g_img_cfg.image_a_end, 0}, {B, g_img_cfg.image_b_start, TEXT_DIM});
+    auto suffix = mx::slice(inputs_embeds, {0, g_img_cfg.image_b_end, 0}, {B, seq_len, TEXT_DIM});
 
     // Concatenate: prefix + img_a + mid + img_b + suffix
     inputs_embeds = mx::concatenate({prefix, img_feats_a, mid, img_feats_b, suffix}, 1);  // [B, seq_len, dim]
@@ -2928,9 +2618,9 @@ mx::array dueling_forward_cached(
     auto inputs_embeds = mx::take(text->embed_tokens, input_ids, 0);  // [B, seq_len, dim]
 
     // 3. Replace image token embeddings with pre-computed vision features
-    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, DUELING_IMAGE_A_START, TEXT_DIM});
-    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END, 0}, {B, DUELING_IMAGE_B_START, TEXT_DIM});
-    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END, 0}, {B, seq_len, TEXT_DIM});
+    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {B, g_img_cfg.image_a_start, TEXT_DIM});
+    auto mid = mx::slice(inputs_embeds, {0, g_img_cfg.image_a_end, 0}, {B, g_img_cfg.image_b_start, TEXT_DIM});
+    auto suffix = mx::slice(inputs_embeds, {0, g_img_cfg.image_b_end, 0}, {B, seq_len, TEXT_DIM});
 
     inputs_embeds = mx::concatenate({prefix, img_embeds_a, mid, img_embeds_b, suffix}, 1);
 
@@ -2953,404 +2643,6 @@ mx::array dueling_forward_cached(
     return compute_logits(last_hidden, text);  // [B, 1, vocab_size]
 }
 
-// Run actual inference from files prepared by Python
-int run_inference_from_files(const std::string& weights_dir) {
-    std::cout << "=== GLM-4V Inference ===" << std::endl;
-
-    // Load tokens from file
-    std::string tokens_path = weights_dir + "/inference_tokens.bin";
-    std::ifstream tokens_file(tokens_path, std::ios::binary);
-    if (!tokens_file) {
-        std::cerr << "Failed to open " << tokens_path << std::endl;
-        return 1;
-    }
-    tokens_file.seekg(0, std::ios::end);
-    size_t tokens_size = tokens_file.tellg();
-    tokens_file.seekg(0, std::ios::beg);
-    int num_tokens = tokens_size / sizeof(int32_t);
-    std::vector<int32_t> tokens(num_tokens);
-    tokens_file.read(reinterpret_cast<char*>(tokens.data()), tokens_size);
-    tokens_file.close();
-    std::cout << "Loaded " << num_tokens << " tokens" << std::endl;
-
-    // Load embeddings from file
-    std::string embeds_path = weights_dir + "/inference_embeds.bin";
-    std::ifstream embeds_file(embeds_path, std::ios::binary);
-    if (!embeds_file) {
-        std::cerr << "Failed to open " << embeds_path << std::endl;
-        return 1;
-    }
-    embeds_file.seekg(0, std::ios::end);
-    size_t embeds_size = embeds_file.tellg();
-    embeds_file.seekg(0, std::ios::beg);
-    int num_embed_floats = embeds_size / sizeof(uint16_t);  // float16
-    int num_image_tokens = num_embed_floats / TEXT_DIM;
-    int num_images = num_image_tokens / DUELING_NUM_IMAGE_TOKENS;
-    std::vector<uint16_t> embeds_raw(num_embed_floats);
-    embeds_file.read(reinterpret_cast<char*>(embeds_raw.data()), embeds_size);
-    embeds_file.close();
-    std::cout << "Loaded " << num_images << " image embedding(s)" << std::endl;
-
-    // Parse metadata
-    std::string meta_path = weights_dir + "/inference_meta.txt";
-    std::ifstream meta_file(meta_path);
-    std::map<std::string, int> meta;
-    std::string line;
-    while (std::getline(meta_file, line)) {
-        auto eq = line.find('=');
-        if (eq != std::string::npos) {
-            std::string key = line.substr(0, eq);
-            int val = std::stoi(line.substr(eq + 1));
-            meta[key] = val;
-        }
-    }
-    meta_file.close();
-
-    // Load text model
-    std::cout << "Loading text model..." << std::endl;
-    TextModelWeights text;
-    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-        std::cerr << "Failed to load text weights" << std::endl;
-        return 1;
-    }
-
-    // Convert embeddings to mx::array
-    auto img_embeds = mx::array(embeds_raw.data(), {num_images, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
-
-    // Run inference based on number of images
-    mx::array logits = empty_array();
-    if (num_images == 2) {
-        // Dueling mode: two images
-        auto img_a = mx::slice(img_embeds, {0, 0, 0}, {1, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM});
-        auto img_b = mx::slice(img_embeds, {1, 0, 0}, {2, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM});
-        img_a = mx::squeeze(img_a, 0);  // [144, 4096]
-        img_b = mx::squeeze(img_b, 0);
-
-        // Expand for batch size 1
-        img_a = mx::expand_dims(img_a, 0);
-        img_b = mx::expand_dims(img_b, 0);
-
-        logits = dueling_forward_cached(img_a, img_b, tokens, &text);
-    } else if (num_images == 1) {
-        // Single image mode
-        int image_start = meta.count("image_start") ? meta["image_start"] : DUELING_IMAGE_A_START;
-        int image_end = meta.count("image_end") ? meta["image_end"] : DUELING_IMAGE_A_END;
-
-        auto img = mx::squeeze(img_embeds, 0);  // [144, 4096]
-
-        // Build embeddings manually
-        int seq_len = num_tokens;
-        auto input_ids = mx::array(tokens.data(), {1, seq_len}, mx::int32);
-        auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
-
-        auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, image_start, TEXT_DIM});
-        auto suffix = mx::slice(inputs_embeds, {0, image_end, 0}, {1, seq_len, TEXT_DIM});
-        img = mx::expand_dims(img, 0);  // [1, 144, 4096]
-
-        inputs_embeds = mx::concatenate({prefix, img, suffix}, 1);
-
-        // Position IDs for single image
-        std::vector<GridTHW> grids = {{1, PATCH_GRID, PATCH_GRID}};
-        auto rope = get_rope_index(input_ids, grids, {}, empty_array());
-        auto position_ids = rope.position_ids;
-
-        // Forward
-        auto hidden_states = text_model_forward_embeds(inputs_embeds, &text, position_ids, empty_array());
-        int T = hidden_states.shape(1);
-        auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {1, T, TEXT_DIM});
-        logits = compute_logits(last_hidden, &text);
-    } else {
-        std::cerr << "Unsupported number of images: " << num_images << std::endl;
-        return 1;
-    }
-
-    mx::eval(logits);
-
-    // Get top token
-    auto last_logits = mx::squeeze(logits, {0, 1});  // [vocab_size]
-    auto top_idx = mx::argmax(last_logits, 0);
-    mx::eval(top_idx);
-    int32_t top_token = top_idx.data<int32_t>()[0];
-
-    // Also get top-5 for context
-    auto sorted_idx = mx::argsort(last_logits, -1);
-    mx::eval(sorted_idx);
-    std::cout << "\n=== Result ===" << std::endl;
-    std::cout << "Top token ID: " << top_token << std::endl;
-
-    // Print some common token mappings for dueling
-    if (top_token == 32) std::cout << "Decoded: 'A'" << std::endl;
-    else if (top_token == 33) std::cout << "Decoded: 'B'" << std::endl;
-    else if (top_token == 362) std::cout << "Decoded: ' A'" << std::endl;
-    else if (top_token == 426) std::cout << "Decoded: ' B'" << std::endl;
-    else std::cout << "(Use Python tokenizer to decode: tokenizer.decode([" << top_token << "]))" << std::endl;
-
-    return 0;
-}
-
-// ============================================================================
-// Dueling Comparison: Compare two pre-computed image embeddings
-// ============================================================================
-
-int run_dueling_comparison(const std::string& embeddings_dir,
-                           const std::string& weights_dir,
-                           int idx_a = -1, int idx_b = -1) {
-    std::cout << "=== Dueling Image Comparison (448x448) ===" << std::endl;
-
-    // 1. Load filenames to get count
-    std::string filenames_path = embeddings_dir + "/filenames.txt";
-    std::ifstream filenames_file(filenames_path);
-    if (!filenames_file) {
-        std::cerr << "Failed to open " << filenames_path << std::endl;
-        return 1;
-    }
-    std::vector<std::string> filenames;
-    std::string line;
-    while (std::getline(filenames_file, line)) {
-        if (!line.empty()) filenames.push_back(line);
-    }
-    filenames_file.close();
-    int num_images = static_cast<int>(filenames.size());
-    std::cout << "Loaded " << num_images << " image filenames" << std::endl;
-
-    if (num_images < 2) {
-        std::cerr << "Need at least 2 images for comparison" << std::endl;
-        return 1;
-    }
-
-    // 2. Pick random indices if not specified
-    if (idx_a < 0 || idx_a >= num_images) {
-        std::srand(static_cast<unsigned>(std::time(nullptr)));
-        idx_a = std::rand() % num_images;
-    }
-    if (idx_b < 0 || idx_b >= num_images) {
-        do {
-            idx_b = std::rand() % num_images;
-        } while (idx_b == idx_a);
-    }
-
-    std::cout << "\nComparing:" << std::endl;
-    std::cout << "  A [" << idx_a << "]: " << filenames[idx_a] << std::endl;
-    std::cout << "  B [" << idx_b << "]: " << filenames[idx_b] << std::endl;
-
-    // 3. Load only the two embeddings we need (memory efficient)
-    std::string embeds_path = embeddings_dir + "/embeddings.bin";
-    std::ifstream embeds_file(embeds_path, std::ios::binary);
-    if (!embeds_file) {
-        std::cerr << "Failed to open " << embeds_path << std::endl;
-        return 1;
-    }
-
-    const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
-    const int embed_dim = TEXT_DIM;  // 4096
-    const size_t bytes_per_image = tokens_per_image * embed_dim * sizeof(uint16_t);
-
-    std::vector<uint16_t> embed_a(tokens_per_image * embed_dim);
-    std::vector<uint16_t> embed_b(tokens_per_image * embed_dim);
-
-    embeds_file.seekg(idx_a * bytes_per_image);
-    embeds_file.read(reinterpret_cast<char*>(embed_a.data()), bytes_per_image);
-    embeds_file.seekg(idx_b * bytes_per_image);
-    embeds_file.read(reinterpret_cast<char*>(embed_b.data()), bytes_per_image);
-    embeds_file.close();
-
-    // Debug: check raw embedding values
-    std::cout << "Raw embedding check (uint16 hex): ";
-    for (int i = 0; i < 5; i++) {
-        std::cout << std::hex << embed_a[i] << " ";
-    }
-    std::cout << std::dec << std::endl;
-
-    // 4. Load prompt tokens
-    std::string tokens_path = weights_dir + "/dueling_prompt_tokens_448.bin";
-    std::ifstream tokens_file(tokens_path, std::ios::binary);
-    if (!tokens_file) {
-        std::cerr << "Failed to open " << tokens_path << std::endl;
-        return 1;
-    }
-    tokens_file.seekg(0, std::ios::end);
-    int num_tokens = tokens_file.tellg() / sizeof(int32_t);
-    tokens_file.seekg(0, std::ios::beg);
-    std::vector<int32_t> tokens(num_tokens);
-    tokens_file.read(reinterpret_cast<char*>(tokens.data()), num_tokens * sizeof(int32_t));
-    tokens_file.close();
-    std::cout << "Loaded " << num_tokens << " prompt tokens" << std::endl;
-
-    // 5. Load text model
-    std::cout << "Loading text model..." << std::endl;
-    TextModelWeights text;
-    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-        std::cerr << "Failed to load text weights" << std::endl;
-        return 1;
-    }
-
-    // 6. Build input embeddings
-    // IMPORTANT: Cast to float16_t* so MLX interprets raw bytes as float16
-    auto img_a = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_a.data()),
-                           {1, tokens_per_image, embed_dim}, mx::float16);
-    auto img_b = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_b.data()),
-                           {1, tokens_per_image, embed_dim}, mx::float16);
-
-    // DEBUG: Try random embeddings instead to test
-    const char* use_random = std::getenv("GLM_RANDOM_EMBEDS");
-    if (use_random && std::string(use_random) == "1") {
-        std::cout << "Using RANDOM embeddings for debugging..." << std::endl;
-        img_a = mx::random::uniform({1, tokens_per_image, embed_dim}, mx::float16);
-        img_b = mx::random::uniform({1, tokens_per_image, embed_dim}, mx::float16);
-    }
-
-    // Debug: try scaling embeddings
-    const char* scale_env = std::getenv("GLM_EMBED_SCALE");
-    if (scale_env) {
-        float scale = std::stof(scale_env);
-        std::cout << "Scaling embeddings by " << scale << std::endl;
-        img_a = mx::multiply(img_a, mx::array(scale, mx::float16));
-        img_b = mx::multiply(img_b, mx::array(scale, mx::float16));
-    }
-
-    // Get text embeddings for the prompt
-    auto input_ids = mx::array(tokens.data(), {1, num_tokens}, mx::int32);
-    auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
-
-    // Replace image token positions with vision embeddings
-    // Layout: [prefix][img_a][mid][img_b][suffix]
-    auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, DUELING_IMAGE_A_START_448, TEXT_DIM});
-    auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END_448, 0}, {1, DUELING_IMAGE_B_START_448, TEXT_DIM});
-    auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END_448, 0}, {1, num_tokens, TEXT_DIM});
-
-    inputs_embeds = mx::concatenate({prefix, img_a, mid, img_b, suffix}, 1);
-
-    // Debug: check shapes
-    std::cout << "Input shapes:" << std::endl;
-    std::cout << "  prefix: [" << prefix.shape(0) << ", " << prefix.shape(1) << ", " << prefix.shape(2) << "]" << std::endl;
-    std::cout << "  img_a: [" << img_a.shape(0) << ", " << img_a.shape(1) << ", " << img_a.shape(2) << "]" << std::endl;
-    std::cout << "  mid: [" << mid.shape(0) << ", " << mid.shape(1) << ", " << mid.shape(2) << "]" << std::endl;
-    std::cout << "  img_b: [" << img_b.shape(0) << ", " << img_b.shape(1) << ", " << img_b.shape(2) << "]" << std::endl;
-    std::cout << "  suffix: [" << suffix.shape(0) << ", " << suffix.shape(1) << ", " << suffix.shape(2) << "]" << std::endl;
-    std::cout << "  inputs_embeds: [" << inputs_embeds.shape(0) << ", " << inputs_embeds.shape(1) << ", " << inputs_embeds.shape(2) << "]" << std::endl;
-
-    // 7. Compute position IDs
-    // Grid is the ORIGINAL grid size (before merge), not the merged size
-    // 448x448 with 14-pixel patches = 32x32 grid
-    std::vector<GridTHW> grids = {
-        {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID},  // 32x32 (before 2x2 merge)
-        {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID}
-    };
-    auto rope = get_rope_index(input_ids, grids, {}, empty_array());
-    auto position_ids = rope.position_ids;
-
-    std::cout << "  position_ids: [" << position_ids.shape(0) << ", " << position_ids.shape(1) << ", " << position_ids.shape(2) << "]" << std::endl;
-
-    // Debug: print first few position IDs
-    mx::eval(position_ids);
-    const int32_t* pos_data = position_ids.data<int32_t>();
-    std::cout << "  pos_ids[0,0,:5]: ";
-    for (int i = 0; i < 5; i++) std::cout << pos_data[i] << " ";
-    std::cout << std::endl;
-    std::cout << "  pos_ids[1,0,:5]: ";
-    for (int i = 0; i < 5; i++) std::cout << pos_data[541 + i] << " ";
-    std::cout << std::endl;
-    std::cout << "  pos_ids[2,0,:5]: ";
-    for (int i = 0; i < 5; i++) std::cout << pos_data[541*2 + i] << " ";
-    std::cout << std::endl;
-    // Also show position IDs at image token start (position 5)
-    std::cout << "  pos_ids at image_a start (pos 5): ";
-    std::cout << "dim0=" << pos_data[5] << " dim1=" << pos_data[541+5] << " dim2=" << pos_data[541*2+5];
-    std::cout << std::endl;
-    std::cout << "  pos_ids at image_a[10] (pos 15): ";
-    std::cout << "dim0=" << pos_data[15] << " dim1=" << pos_data[541+15] << " dim2=" << pos_data[541*2+15];
-    std::cout << std::endl;
-
-    // Debug: check embedding magnitudes (convert to float32 for accurate stats)
-    mx::eval(inputs_embeds);
-    mx::eval(img_a);
-    std::cout << "Embedding stats:" << std::endl;
-    auto img_a_f32 = mx::astype(img_a, mx::float32);
-    auto prefix_f32 = mx::astype(prefix, mx::float32);
-    auto text_embeds_abs = mx::mean(mx::abs(prefix_f32));
-    auto img_embeds_abs = mx::mean(mx::abs(img_a_f32));
-    mx::eval(text_embeds_abs);
-    mx::eval(img_embeds_abs);
-    std::cout << "  text embeddings mean |x|: " << text_embeds_abs.item<float>() << std::endl;
-    std::cout << "  vision embeddings mean |x|: " << img_embeds_abs.item<float>() << std::endl;
-
-    // Print first few raw values from img_a
-    const mlx::core::float16_t* img_data = img_a.data<mlx::core::float16_t>();
-    std::cout << "  img_a first 5 values: ";
-    for (int i = 0; i < 5; i++) {
-        std::cout << static_cast<float>(img_data[i]) << " ";
-    }
-    std::cout << std::endl;
-
-    // 8. Forward pass
-    std::cout << "Running inference..." << std::endl;
-    auto start = std::chrono::steady_clock::now();
-    auto hidden_states = text_model_forward_embeds(inputs_embeds, &text, position_ids, empty_array());
-    int T = hidden_states.shape(1);
-    auto last_hidden = mx::slice(hidden_states, {0, T-1, 0}, {1, T, TEXT_DIM});
-
-    // Debug: check hidden state
-    mx::eval(last_hidden);
-    std::cout << "  last_hidden shape: [" << last_hidden.shape(0) << ", " << last_hidden.shape(1)
-              << ", " << last_hidden.shape(2) << "] dtype=" << last_hidden.dtype() << std::endl;
-    // Convert to float32 before computing stats
-    auto last_hidden_f32 = mx::astype(last_hidden, mx::float32);
-    mx::eval(last_hidden_f32);
-    auto hidden_abs = mx::mean(mx::abs(last_hidden_f32));
-    mx::eval(hidden_abs);
-    std::cout << "  hidden state mean |x|: " << hidden_abs.item<float>() << std::endl;
-
-    auto logits = compute_logits(last_hidden, &text);
-    mx::eval(logits);
-    auto end = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(end - start).count();
-
-    // 9. Get result
-    auto last_logits = mx::squeeze(logits, {0, 1});
-    mx::eval(last_logits);
-
-    // Debug: check logits stats
-    std::cout << "  logits shape: " << last_logits.shape(0) << " dtype=" << last_logits.dtype() << std::endl;
-    auto logits_f32 = mx::astype(last_logits, mx::float32);
-    mx::eval(logits_f32);
-    const float* lf32 = logits_f32.data<float>();
-    std::cout << "  logits[32] (A): " << lf32[32] << std::endl;
-    std::cout << "  logits[33] (B): " << lf32[33] << std::endl;
-    std::cout << "  logits[151361]: " << lf32[151361] << std::endl;
-
-    // Get top 10 tokens
-    auto sorted_indices = mx::argsort(last_logits, -1);
-    mx::eval(sorted_indices);
-
-    std::cout << "\n=== Result ===" << std::endl;
-    std::cout << "Inference time: " << std::fixed << std::setprecision(2) << elapsed << "s" << std::endl;
-
-    std::cout << "Top 10 tokens:" << std::endl;
-    int vocab_size = logits_f32.shape(0);  // Use the float32 version
-    const int32_t* indices_data = sorted_indices.data<int32_t>();
-    for (int i = 0; i < 10; i++) {
-        int idx = indices_data[vocab_size - 1 - i];  // Descending order
-        float logit = lf32[idx];  // Use float32 pointer
-        std::cout << "  [" << i << "] token " << idx << " (logit=" << std::fixed << std::setprecision(2) << logit << ")";
-        if (idx == 32) std::cout << " -> 'A'";
-        else if (idx == 33) std::cout << " -> 'B'";
-        else if (idx == 362) std::cout << " -> ' A'";
-        else if (idx == 425) std::cout << " -> ' B'";
-        std::cout << std::endl;
-    }
-
-    int32_t top_token = indices_data[vocab_size - 1];
-
-    // Decode common responses
-    if (top_token == 32) std::cout << "\nWinner: A" << std::endl;
-    else if (top_token == 33) std::cout << "\nWinner: B" << std::endl;
-    else if (top_token == 362) std::cout << "\nWinner: A" << std::endl;
-    else if (top_token == 426) std::cout << "\nWinner: B" << std::endl;
-    else std::cout << "\n(Top token " << top_token << " - not A or B)" << std::endl;
-
-    return 0;
-}
-
 // ============================================================================
 // Precompute Embeddings: JPEG -> Vision Encoder -> Save to Disk
 // ============================================================================
@@ -3367,8 +2659,8 @@ int run_precompute_embeddings(const std::string& input_dir,
     std::cout << "=== Precompute Vision Embeddings ===" << std::endl;
     std::cout << "Input:  " << input_dir << std::endl;
     std::cout << "Output: " << output_dir << std::endl;
-    std::cout << "Config: " << PRECOMPUTE_SIZE << "x" << PRECOMPUTE_SIZE
-              << " -> " << PRECOMPUTE_TOKENS << " tokens per image" << std::endl;
+    std::cout << "Config: " << g_img_cfg.image_size << "x" << g_img_cfg.image_size
+              << " -> " << g_img_cfg.tokens_per_image << " tokens per image" << std::endl;
     std::cout << "Batch:  " << batch_size << std::endl;
 
     // Create output directory
@@ -3396,6 +2688,16 @@ int run_precompute_embeddings(const std::string& input_dir,
         std::cerr << "Failed to load vision weights" << std::endl;
         return 1;
     }
+
+    // Create fixed grid_thw for compiled vision forward (fixed batch size for compilation)
+    std::vector<GridTHW> fixed_grid_thw;
+    for (int i = 0; i < batch_size; ++i) {
+        fixed_grid_thw.push_back({1, g_img_cfg.grid, g_img_cfg.grid});
+    }
+
+    // Create compiled vision forward ONCE (first call will compile the graph)
+    std::cout << "Creating compiled vision forward (will compile on first call)..." << std::endl;
+    auto compiled_vision = make_compiled_vision_forward(&vision, fixed_grid_thw);
 
     // Double-buffer state
     PrecomputeBuffer buffers[2];
@@ -3462,10 +2764,10 @@ int run_precompute_embeddings(const std::string& input_dir,
 
                 // Resize and pad to target size
                 std::vector<uint8_t> resized;
-                resize_and_pad(pixels, w, h, &resized, PRECOMPUTE_SIZE);
+                resize_and_pad(pixels, w, h, &resized, g_img_cfg.image_size);
 
                 // Normalize and patchify
-                auto patches = normalize_and_patchify(resized, PRECOMPUTE_SIZE, PRECOMPUTE_PATCH);
+                auto patches = normalize_and_patchify(resized, g_img_cfg.image_size, 14);
                 buf.patches.push_back(patches);
                 buf.paths.push_back(path);
             }
@@ -3514,27 +2816,41 @@ int run_precompute_embeddings(const std::string& input_dir,
 
         // Batch patches: [B * num_patches, patch_dim]
         auto batched_patches = batch_patches(buf.patches);
-        int B = static_cast<int>(buf.patches.size());
+        int actual_B = static_cast<int>(buf.patches.size());
 
-        // Grid info for batched forward
-        std::vector<GridTHW> grid_thw;
-        for (int i = 0; i < B; ++i) {
-            grid_thw.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});
+        // Pad to fixed batch_size for compiled forward if needed
+        mx::array padded_patches = batched_patches;
+        if (actual_B < batch_size) {
+            // Pad with zeros to reach fixed batch_size
+            int patches_per_image = batched_patches.shape(0) / actual_B;
+            int total_patches_needed = batch_size * patches_per_image;
+            int padding_patches = total_patches_needed - batched_patches.shape(0);
+            auto padding = mx::zeros({padding_patches, batched_patches.shape(1)}, batched_patches.dtype());
+            padded_patches = mx::concatenate({batched_patches, padding}, 0);
         }
 
-        // Run vision encoder
-        auto embeddings = vision_forward(batched_patches, &vision, grid_thw);
+        // Run compiled vision encoder (uses fixed batch_size grid_thw)
+        auto result = compiled_vision({padded_patches});
+        auto embeddings = result[0];
         mx::eval(embeddings);
 
-        // embeddings shape: [B * PRECOMPUTE_TOKENS, TEXT_DIM]
-        // Reshape to [B, PRECOMPUTE_TOKENS, TEXT_DIM]
-        embeddings = mx::reshape(embeddings, {B, PRECOMPUTE_TOKENS, TEXT_DIM});
+        // Slice to actual batch size if we padded
+        // embeddings shape: [batch_size * tokens_per_image, TEXT_DIM]
+        if (actual_B < batch_size) {
+            int actual_tokens = actual_B * g_img_cfg.tokens_per_image;
+            embeddings = mx::slice(embeddings, {0, 0}, {actual_tokens, TEXT_DIM});
+        }
+        int B = actual_B;
+
+        // embeddings shape: [B * tokens_per_image, TEXT_DIM]
+        // Reshape to [B, tokens_per_image, TEXT_DIM]
+        embeddings = mx::reshape(embeddings, {B, g_img_cfg.tokens_per_image, TEXT_DIM});
 
         // Convert to float16 and write
         auto emb_fp16 = mx::astype(embeddings, mx::float16);
         mx::eval(emb_fp16);
         const uint16_t* emb_data = emb_fp16.data<uint16_t>();
-        size_t emb_bytes = static_cast<size_t>(B) * PRECOMPUTE_TOKENS * TEXT_DIM * sizeof(uint16_t);
+        size_t emb_bytes = static_cast<size_t>(B) * g_img_cfg.tokens_per_image * TEXT_DIM * sizeof(uint16_t);
         emb_out.write(reinterpret_cast<const char*>(emb_data), emb_bytes);
 
         // Write filenames
@@ -3585,1254 +2901,29 @@ int run_precompute_embeddings(const std::string& input_dir,
     return 0;
 }
 
-int run_dueling_bench(const std::string& weights_dir) {
-    std::cout << "=== Dueling Bandits Benchmark (Cached Embeddings) ===" << std::endl;
-    std::cout << "NOTE: Vision encoder runs ONCE per image (amortized)." << std::endl;
-    std::cout << "      This benchmark measures TEXT MODEL throughput only.\n" << std::endl;
-
-    // Load prompt tokens
-    std::string prompt_path = weights_dir + "/dueling_prompt_tokens.bin";
-    auto prompt_tokens = load_dueling_prompt(prompt_path);
-    if (prompt_tokens.empty()) {
-        std::cerr << "Failed to load prompt tokens" << std::endl;
-        return 1;
-    }
-    std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens" << std::endl;
-
-    // Only load text model - vision embeddings are pre-computed
-    std::cout << "Loading text model..." << std::endl;
-    TextModelWeights text;
-    if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-        std::cerr << "Failed to load text weights" << std::endl;
-        return 1;
+int main(int argc, char* argv[]) {
+    auto gpu = mx::Device(mx::Device::gpu, 0);
+    if (mx::is_available(gpu)) {
+        mx::set_default_device(gpu);
+    } else {
+        mx::set_default_device(mx::Device(mx::Device::cpu, 0));
+        std::cout << "GPU not available; using CPU." << std::endl;
     }
 
-    // Benchmark config
-    const char* batch_env = std::getenv("GLM_BATCH_SIZE");
-    int B = batch_env ? std::atoi(batch_env) : 8;
-    int iters = 50;  // More iterations since text-only is faster
-    int warmup = 5;
-
-    std::cout << "\nBenchmark config: B=" << B << ", iters=" << iters << std::endl;
-
-    // Create "pre-computed" image embeddings [B, 144, 4096]
-    // In production, these would come from disk/cache after one-time vision encoding
-    auto img_embeds_a = mx::random::uniform({B, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
-    auto img_embeds_b = mx::random::uniform({B, DUELING_NUM_IMAGE_TOKENS, TEXT_DIM}, mx::float16);
-    mx::eval({img_embeds_a, img_embeds_b});
-
-    // Warmup
-    std::cout << "Warmup..." << std::endl;
-    for (int i = 0; i < warmup; ++i) {
-        auto logits = dueling_forward_cached(img_embeds_a, img_embeds_b, prompt_tokens, &text);
-        mx::eval(logits);
-    }
-    mx::synchronize();
-
-    // Benchmark
-    std::cout << "Benchmarking..." << std::endl;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        auto logits = dueling_forward_cached(img_embeds_a, img_embeds_b, prompt_tokens, &text);
-        mx::eval(logits);
-    }
-    mx::synchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    double comparisons_per_sec = (double)(B * iters) / elapsed.count();
-    double ms_per_comparison = (elapsed.count() * 1000.0) / (B * iters);
-    double tokens_per_sec = comparisons_per_sec * prompt_tokens.size();
-
-    std::cout << "\n=== Results (Text Model Only) ===" << std::endl;
-    std::cout << "Batch size: " << B << std::endl;
-    std::cout << "Seq length: " << prompt_tokens.size() << " tokens" << std::endl;
-    std::cout << "Time per batch: " << (elapsed.count() * 1000.0 / iters) << " ms" << std::endl;
-    std::cout << "Comparisons/sec: " << comparisons_per_sec << std::endl;
-    std::cout << "ms/comparison: " << ms_per_comparison << std::endl;
-    std::cout << "Tokens/sec: " << tokens_per_sec << std::endl;
-
-    return 0;
-}
-
-int run_vision_bench() {
-    const int B = GLM_FIXED_BATCH;
-    const int iters = GLM_FIXED_ITERS;
-    const int warmup = GLM_FIXED_WARMUP;
-    auto input = mx::random::uniform({B, IMAGE_SIZE, IMAGE_SIZE, 3}, mx::float16);
-    auto patchified = patchify_images(input);
-
-    VisionWeights model;
-    init_model(&model, mx::float16);
-
+    // Enable MLX compilation for optimized graph execution
     mx::enable_compile();
     mx::set_compile_mode(mx::CompileMode::enabled);
 
-    auto compiled = mx::compile([&model, grid_thw = patchified.grid_thw](const std::vector<mx::array>& inputs) {
-        auto out = vision_forward(inputs[0], &model, grid_thw);
-        return std::vector<mx::array>{out};
-    });
-
-    std::vector<mx::array> inputs{patchified.patches};
-
-    std::cout << "Compiling..." << std::endl;
-    auto first = compiled(inputs);
-    mx::eval(first);
-    mx::synchronize();
-
-    for (int i = 0; i < warmup; ++i) {
-        auto out = compiled(inputs)[0];
-        mx::eval(out);
-    }
-    mx::synchronize();
-
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        auto out = compiled(inputs)[0];
-        mx::eval(out);
-    }
-    mx::synchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    double images_per_sec = (double)(B * iters) / elapsed.count();
-
-    auto output = compiled(inputs)[0];
-    mx::eval(output);
-    mx::synchronize();
-
-    // Vision output is 2D: [merge_tokens, MERGE_DIM]
-    std::cout << "Output shape: " << output.shape(0) << "x" << output.shape(1) << std::endl;
-    std::cout << "Throughput: " << images_per_sec << " images/s" << std::endl;
-    return 0;
-}
-
-int run_text_bench() {
-    const int B = GLM_TEXT_FIXED_BATCH;
-    const int T = GLM_TEXT_SEQ_LEN;
-    const int iters = GLM_TEXT_FIXED_ITERS;
-    const int warmup = GLM_TEXT_FIXED_WARMUP;
-
-    std::cout << "Initializing text model (random weights)..." << std::endl;
-    TextModelWeights model;
-    init_text_model(&model, mx::float16);
-
-    std::cout << "Creating inputs (B=" << B << ", T=" << T << ")..." << std::endl;
-    auto input_ids = mx::random::randint(0, TEXT_VOCAB_SIZE, {B, T}, mx::int32);
-    auto position_ids = make_default_position_ids(B, T);
-    mx::eval({input_ids, position_ids});
-
-    std::cout << "Warmup..." << std::endl;
-    for (int i = 0; i < warmup; ++i) {
-        auto out = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-
-    std::cout << "Benchmarking..." << std::endl;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        auto out = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    double tokens_per_sec = (double)(B * T * iters) / elapsed.count();
-
-    auto output = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-    mx::eval(output);
-    mx::synchronize();
-
-    std::cout << "Output shape: " << output.shape(0) << "x" << output.shape(1)
-              << "x" << output.shape(2) << std::endl;
-    std::cout << "Throughput: " << tokens_per_sec << " tokens/s" << std::endl;
-    return 0;
-}
-
-int run_int8_text_bench(const std::string& weights_dir) {
-    const char* batch_env = std::getenv("GLM_BATCH_SIZE");
-    const int B = batch_env ? std::atoi(batch_env) : 16;
-    const int T = GLM_TEXT_SEQ_LEN;
-    const int iters = 20;
-    const int warmup = 5;
-
-    std::cout << "=== INT8 Text Model Throughput Benchmark ===" << std::endl;
-    std::cout << "Loading INT8 quantized text model..." << std::endl;
-
-    QuantizedTextModelWeights model;
-    std::string int8_path = weights_dir + "/text_model_int8.bin";
-    if (!load_quantized_text_weights(&model, int8_path)) {
-        std::cerr << "Failed to load INT8 weights from " << int8_path << std::endl;
-        return 1;
-    }
-    std::cout << "INT8 model loaded." << std::endl;
-
-    std::cout << "\nBenchmark config: B=" << B << ", T=" << T
-              << ", iters=" << iters << ", warmup=" << warmup << std::endl;
-
-    auto input_ids = mx::random::randint(0, TEXT_VOCAB_SIZE, {B, T}, mx::int32);
-    auto position_ids = make_default_position_ids(B, T);
-    mx::eval({input_ids, position_ids});
-
-    std::cout << "Warmup..." << std::endl;
-    for (int i = 0; i < warmup; ++i) {
-        auto out = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-
-    std::cout << "Benchmarking INT8..." << std::endl;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        auto out = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> elapsed = end - start;
-    double tokens_per_sec = (double)(B * T * iters) / elapsed.count();
-    double ms_per_iter = (elapsed.count() * 1000.0) / iters;
-
-    auto output = quantized_text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-    mx::eval(output);
-    mx::synchronize();
-
-    std::cout << "\n=== INT8 Results ===" << std::endl;
-    std::cout << "Output shape: " << output.shape(0) << "x" << output.shape(1)
-              << "x" << output.shape(2) << std::endl;
-    std::cout << "Time per forward: " << ms_per_iter << " ms" << std::endl;
-    std::cout << "Throughput: " << tokens_per_sec << " tokens/s" << std::endl;
-
-    // Also run FP16 for comparison
-    std::cout << "\nLoading FP16 text model for comparison..." << std::endl;
-    TextModelWeights fp16_model;
-    std::string fp16_path = weights_dir + "/text_model.bin";
-    if (!load_text_weights(&fp16_model, fp16_path)) {
-        std::cerr << "Failed to load FP16 weights" << std::endl;
-        return 1;
-    }
-
-    std::cout << "Warmup FP16..." << std::endl;
-    for (int i = 0; i < warmup; ++i) {
-        auto out = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-
-    std::cout << "Benchmarking FP16..." << std::endl;
-    start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        auto out = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
-        mx::eval(out);
-    }
-    mx::synchronize();
-    end = std::chrono::high_resolution_clock::now();
-
-    elapsed = end - start;
-    double fp16_tokens_per_sec = (double)(B * T * iters) / elapsed.count();
-    double fp16_ms_per_iter = (elapsed.count() * 1000.0) / iters;
-
-    std::cout << "\n=== FP16 Results ===" << std::endl;
-    std::cout << "Time per forward: " << fp16_ms_per_iter << " ms" << std::endl;
-    std::cout << "Throughput: " << fp16_tokens_per_sec << " tokens/s" << std::endl;
-
-    std::cout << "\n=== Comparison ===" << std::endl;
-    double speedup = tokens_per_sec / fp16_tokens_per_sec;
-    std::cout << "INT8 vs FP16 speedup: " << speedup << "x" << std::endl;
-    std::cout << "Memory: INT8 ~9.6 GB vs FP16 ~17.9 GB (1.87x smaller)" << std::endl;
-
-    return 0;
-}
-
-// ==================== Vision Verification ====================
-
-int run_vision_verify(const std::string& weights_dir) {
-    std::cout << "=== Vision Encoder Verification ===" << std::endl;
-
-    // Paths
-    std::string raw_path = weights_dir + "/vision_encoder.bin";
-    std::string patches_path = weights_dir + "/test_patches.bin";
-    std::string expected_path = weights_dir + "/expected_output.bin";
-
-    // Load vision model weights from raw binary via mmap
-    VisionWeights model;
-    if (!load_vision_weights(&model, raw_path)) {
-        std::cerr << "Failed to load vision weights" << std::endl;
-        std::cerr << "Make sure to run: python3 export_vision_weights.py --format raw" << std::endl;
-        return 1;
-    }
-
-    // Print some weight shapes to verify loading
-    std::cout << "\nLoaded weight shapes:" << std::endl;
-    print_array_stats("  patch_embed.weight", model.patch_embed_weight);
-    print_array_stats("  pos_embed.weight", model.pos_embed_weight);
-    print_array_stats("  blocks.0.norm1.weight", model.blocks[0].norm1.weight);
-    print_array_stats("  merger.proj.weight", model.merger.proj.weight);
-
-    // Load test patches
-    // For a 336x336 image with patch_size=14, temporal_patch=2:
-    // grid_t=1, grid_h=24, grid_w=24 -> 576 patches
-    // Each patch has PATCH_INPUT_DIM = 3 * 2 * 14 * 14 = 1176 elements
-    int num_patches = 576;  // 24 * 24 * 1
-    int patch_dim = PATCH_INPUT_DIM;
-
-    auto patches = load_binary_f32(patches_path, {num_patches, patch_dim});
-    if (patches.size() == 0) {
-        std::cerr << "Failed to load test patches" << std::endl;
-        return 1;
-    }
-    print_array_stats("\nInput patches", patches);
-
-    // Load expected output
-    // After merging: 576 / 4 = 144 tokens, each with MERGE_DIM=4096
-    int output_tokens = num_patches / (SPATIAL_MERGE_SIZE * SPATIAL_MERGE_SIZE);
-    auto expected = load_binary_f32(expected_path, {output_tokens, MERGE_DIM});
-    if (expected.size() == 0) {
-        std::cerr << "Failed to load expected output" << std::endl;
-        return 1;
-    }
-    print_array_stats("Expected output", expected);
-
-    // Create grid_thw for single image
-    std::vector<GridTHW> grid_thw = {{1, 24, 24}};  // t=1, h=24, w=24
-
-    // Run forward pass
-    std::cout << "\nRunning C++ forward pass..." << std::endl;
-    auto output = vision_forward(patches, &model, grid_thw);
-    mx::eval(output);
-    mx::synchronize();
-
-    print_array_stats("C++ output", output);
-
-    // Compare outputs
-    std::cout << "\n=== Comparison Results ===" << std::endl;
-
-    float max_diff = max_abs_diff(output, expected);
-    float mean_diff = mean_abs_diff(output, expected);
-
-    std::cout << "Max absolute difference: " << max_diff << std::endl;
-    std::cout << "Mean absolute difference: " << mean_diff << std::endl;
-
-    // Check if within tolerance
-    const float tolerance = 1e-3f;  // Tolerance for float32 comparison
-    if (max_diff < tolerance) {
-        std::cout << "\n[PASS] Outputs match within tolerance (" << tolerance << ")" << std::endl;
-        return 0;
-    } else {
-        std::cout << "\n[FAIL] Outputs differ by more than tolerance (" << tolerance << ")" << std::endl;
-
-        // Debug: print first few values
-        std::cout << "\nFirst 10 output values comparison:" << std::endl;
-        auto out_f32 = mx::astype(output, mx::float32);
-        auto exp_f32 = mx::astype(expected, mx::float32);
-        mx::eval({out_f32, exp_f32});
-
-        auto out_flat = mx::reshape(out_f32, {-1});
-        auto exp_flat = mx::reshape(exp_f32, {-1});
-        mx::eval({out_flat, exp_flat});
-
-        // Copy to CPU for printing
-        out_flat = mx::copy(out_flat, mx::Device(mx::Device::cpu, 0));
-        exp_flat = mx::copy(exp_flat, mx::Device(mx::Device::cpu, 0));
-        mx::eval({out_flat, exp_flat});
-
-        const float* out_ptr = out_flat.data<float>();
-        const float* exp_ptr = exp_flat.data<float>();
-
-        std::cout << "  Index\tC++\t\tPython\t\tDiff" << std::endl;
-        for (int i = 0; i < 10 && i < out_flat.size(); ++i) {
-            std::cout << "  " << i << "\t" << out_ptr[i] << "\t"
-                      << exp_ptr[i] << "\t" << std::abs(out_ptr[i] - exp_ptr[i]) << std::endl;
-        }
-
-        return 1;
-    }
-}
-
-// ==================== Vision Verification 448x448 ====================
-
-int run_vision_verify_448(const std::string& weights_dir) {
-    std::cout << "=== Vision Encoder Verification (448x448) ===" << std::endl;
-
-    // Use test_img100 patches for real-image verification
-    const char* use_img100 = std::getenv("GLM_USE_IMG100");
-    bool test_img100 = (use_img100 && std::string(use_img100) == "1");
-
-    // Paths
-    std::string raw_path = weights_dir + "/vision_encoder.bin";
-    std::string patches_path = test_img100 ?
-        weights_dir + "/test_img100_patches.bin" :
-        weights_dir + "/test_patches_448.bin";
-    std::string expected_path = test_img100 ?
-        weights_dir + "/expected_img100_output.bin" :
-        weights_dir + "/expected_output_448.bin";
-
-    // Load vision model weights
-    VisionWeights model;
-    if (!load_vision_weights(&model, raw_path)) {
-        std::cerr << "Failed to load vision weights" << std::endl;
-        return 1;
-    }
-
-    // For a 448x448 image with patch_size=14:
-    // grid_h=32, grid_w=32 -> 1024 patches
-    int num_patches = 1024;  // 32 * 32 * 1
-    int patch_dim = PATCH_INPUT_DIM;  // 1176
-
-    auto patches = load_binary_f32(patches_path, {num_patches, patch_dim});
-    if (patches.size() == 0) {
-        std::cerr << "Failed to load test patches" << std::endl;
-        return 1;
-    }
-    print_array_stats("\nInput patches", patches);
-
-    // Load expected output: 1024 / 4 = 256 tokens
-    int output_tokens = 256;
-    auto expected = load_binary_f32(expected_path, {output_tokens, MERGE_DIM});
-    if (expected.size() == 0) {
-        std::cerr << "Failed to load expected output" << std::endl;
-        return 1;
-    }
-    print_array_stats("Expected output", expected);
-
-    // Create grid_thw for single 448x448 image
-    std::vector<GridTHW> grid_thw = {{1, 32, 32}};  // t=1, h=32, w=32
-
-    // Run forward pass
-    std::cout << "\nRunning C++ forward pass..." << std::endl;
-    auto output = vision_forward(patches, &model, grid_thw);
-    mx::eval(output);
-    mx::synchronize();
-
-    print_array_stats("C++ output", output);
-
-    // Compare outputs
-    std::cout << "\n=== Comparison Results ===" << std::endl;
-
-    float max_diff = max_abs_diff(output, expected);
-    float mean_diff = mean_abs_diff(output, expected);
-
-    std::cout << "Max absolute difference: " << max_diff << std::endl;
-    std::cout << "Mean absolute difference: " << mean_diff << std::endl;
-
-    // Check within tolerance
-    const float tolerance = 0.015f;  // Slightly higher tolerance for larger grid
-    if (max_diff < tolerance) {
-        std::cout << "\n[PASS] Outputs match within tolerance (" << tolerance << ")" << std::endl;
-        return 0;
-    } else {
-        std::cout << "\n[FAIL] Outputs differ by more than tolerance (" << tolerance << ")" << std::endl;
-
-        // Debug: print first few values
-        std::cout << "\nFirst 10 output values comparison:" << std::endl;
-        auto out_f32 = mx::astype(output, mx::float32);
-        auto exp_f32 = mx::astype(expected, mx::float32);
-        mx::eval({out_f32, exp_f32});
-
-        auto out_flat = mx::reshape(out_f32, {-1});
-        auto exp_flat = mx::reshape(exp_f32, {-1});
-        mx::eval({out_flat, exp_flat});
-
-        const float* out_ptr = out_flat.data<float>();
-        const float* exp_ptr = exp_flat.data<float>();
-
-        std::cout << "  Index\tC++\t\tPython\t\tDiff" << std::endl;
-        for (int i = 0; i < 10; ++i) {
-            std::cout << "  " << i << "\t" << out_ptr[i] << "\t"
-                      << exp_ptr[i] << "\t" << std::abs(out_ptr[i] - exp_ptr[i]) << std::endl;
-        }
-
-        return 1;
-    }
-}
-
-// ==================== Text Model Verification ====================
-
-int run_text_verify(const std::string& weights_dir) {
-    std::cout << "=== Text Model Verification ===" << std::endl;
-
-    // Paths
-    std::string weights_path = weights_dir + "/text_model.bin";
-    std::string input_ids_path = weights_dir + "/test_input_ids.bin";
-    std::string expected_hidden_path = weights_dir + "/expected_text_hidden.bin";
-    std::string expected_logits_path = weights_dir + "/expected_text_logits.bin";
-
-    // Load text model weights
-    TextModelWeights model;
-    if (!load_text_weights(&model, weights_path)) {
-        std::cerr << "Failed to load text weights" << std::endl;
-        std::cerr << "Make sure to run: python3 export_vision_weights.py --text" << std::endl;
-        return 1;
-    }
-
-    // Print some weight shapes to verify loading
-    std::cout << "\nLoaded weight shapes:" << std::endl;
-    print_array_stats("  embed_tokens", model.embed_tokens);
-    print_array_stats("  layers.0.input_layernorm", model.layers[0].input_layernorm.weight);
-    print_array_stats("  layers.0.q_proj.weight", model.layers[0].self_attn.q_proj.weight);
-    print_array_stats("  norm.weight", model.norm.weight);
-    print_array_stats("  lm_head.weight", model.lm_head.weight);
-
-    // Load test input_ids
-    // Shape: [1, 32] for batch_size=1, seq_len=32
-    const int batch_size = 1;
-    const int seq_len = 32;
-
-    std::ifstream ids_file(input_ids_path, std::ios::binary);
-    if (!ids_file.is_open()) {
-        std::cerr << "Failed to open: " << input_ids_path << std::endl;
-        return 1;
-    }
-
-    std::vector<int32_t> input_ids_data(batch_size * seq_len);
-    ids_file.read(reinterpret_cast<char*>(input_ids_data.data()), batch_size * seq_len * sizeof(int32_t));
-    ids_file.close();
-
-    auto input_ids = mx::array(input_ids_data.data(), {batch_size, seq_len}, mx::int32);
-    std::cout << "\nInput IDs loaded: [" << batch_size << ", " << seq_len << "]" << std::endl;
-
-    // Load expected hidden states
-    auto expected_hidden = load_binary_f32(expected_hidden_path, {batch_size, seq_len, TEXT_DIM});
-    if (expected_hidden.size() == 0) {
-        std::cerr << "Failed to load expected hidden states" << std::endl;
-        return 1;
-    }
-    print_array_stats("Expected hidden", expected_hidden);
-
-    // Load expected logits (optional, for full verification)
-    auto expected_logits = load_binary_f32(expected_logits_path, {batch_size, seq_len, TEXT_VOCAB_SIZE});
-    bool have_logits = (expected_logits.size() != 0);
-    if (have_logits) {
-        print_array_stats("Expected logits", expected_logits);
-    }
-
-    // Step verification: Check embeddings first
-    std::cout << "\n=== Step Verification ===" << std::endl;
-
-    // Load expected embeddings and layer 0 output
-    auto expected_embeds = load_binary_f32(weights_dir + "/expected_embeddings.bin", {batch_size, seq_len, TEXT_DIM});
-    auto expected_layer0 = load_binary_f32(weights_dir + "/expected_layer0.bin", {batch_size, seq_len, TEXT_DIM});
-
-    // Step 1: Check embedding lookup
-    auto embeddings = mx::take(model.embed_tokens, input_ids, 0);
-    mx::eval(embeddings);
-    print_array_stats("C++ embeddings", embeddings);
-    if (expected_embeds.size() > 0) {
-        float embed_diff = max_abs_diff(embeddings, expected_embeds);
-        std::cout << "Embedding max diff: " << embed_diff << (embed_diff < 0.01 ? " [OK]" : " [MISMATCH]") << std::endl;
-    }
-
-    // Step 2: Check first layer output - with detailed debugging
-    auto position_ids = make_default_position_ids(batch_size, seq_len);
-    auto position_embeddings = text_rotary_embeddings(embeddings, position_ids);
-
-    // Debug: trace through layer 0 step by step
-    auto& layer0 = model.layers[0];
-
-    // Helper to print first N values
-    auto print_first_n = [](const mx::array& arr, int n, const std::string& label) {
-        auto f32 = mx::astype(arr, mx::float32);
-        mx::eval(f32);
-        auto cpu = mx::copy(f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval(cpu);
-        std::cout << "      " << label << " first " << n << ": ";
-        const float* data = cpu.data<float>();
-        for (int i = 0; i < n; ++i) std::cout << data[i] << " ";
-        std::cout << std::endl;
-    };
-
-    // 2a: RMS norm on embeddings
-    auto x_norm = rms_norm(embeddings, &layer0.input_layernorm, TEXT_RMS_EPS);
-    mx::eval(x_norm);
-    print_array_stats("  2a. After input_layernorm", x_norm);
-    print_first_n(x_norm, 5, "values");
-
-    // 2b: Q, K, V projections
-    auto q = fast_linear(x_norm, &layer0.self_attn.q_proj);
-    auto k = fast_linear(x_norm, &layer0.self_attn.k_proj);
-    auto v = fast_linear(x_norm, &layer0.self_attn.v_proj);
-    mx::eval({q, k, v});
-    print_array_stats("  2b. Q projection", q);
-    print_first_n(q, 5, "Q");
-    print_array_stats("      K projection", k);
-    print_first_n(k, 5, "K");
-    print_array_stats("      V projection", v);
-    print_first_n(v, 5, "V");
-
-    // Debug: Q, K, V at token 13
-    auto print_token13 = [](const mx::array& arr, const std::string& label) {
-        auto f32 = mx::astype(arr, mx::float32);
-        mx::eval(f32);
-        auto cpu = mx::copy(f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval(cpu);
-        const float* data = cpu.data<float>();
-        int D = arr.shape(2);
-        std::cout << "    " << label << " @ token 13, first 5 dims: ";
-        for (int d = 0; d < 5; ++d) {
-            std::cout << data[13 * D + d] << " ";
-        }
-        std::cout << std::endl;
-    };
-    std::cout << "\n  Debug Q/K/V at token 13:" << std::endl;
-    print_token13(x_norm, "x_norm");
-    print_token13(q, "Q");
-    print_token13(k, "K");
-    print_token13(v, "V");
-
-    // Debug: position embeddings at token 13
-    auto print_pos_emb = [](const std::pair<mx::array, mx::array>& pe, int token, const std::string& label) {
-        auto cos = pe.first;  // [3, B, T, rotary_dim]
-        auto sin = pe.second;
-        auto cos_f32 = mx::astype(cos, mx::float32);
-        auto sin_f32 = mx::astype(sin, mx::float32);
-        mx::eval({cos_f32, sin_f32});
-        auto cos_cpu = mx::copy(cos_f32, mx::Device(mx::Device::cpu, 0));
-        auto sin_cpu = mx::copy(sin_f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval({cos_cpu, sin_cpu});
-        const float* cos_data = cos_cpu.data<float>();
-        const float* sin_data = sin_cpu.data<float>();
-        // Shape is [3, B, T, rotary_dim], print section 0 at token
-        int B = cos.shape(1);
-        int T = cos.shape(2);
-        int D = cos.shape(3);
-        std::cout << "    " << label << " shape: [" << cos.shape(0) << ", " << B << ", " << T << ", " << D << "]" << std::endl;
-        std::cout << "    " << label << " cos @ sec0, token " << token << ", first 5 dims: ";
-        for (int d = 0; d < 5; ++d) {
-            std::cout << cos_data[0 * B * T * D + 0 * T * D + token * D + d] << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "    " << label << " sin @ sec0, token " << token << ", first 5 dims: ";
-        for (int d = 0; d < 5; ++d) {
-            std::cout << sin_data[0 * B * T * D + 0 * T * D + token * D + d] << " ";
-        }
-        std::cout << std::endl;
-    };
-    print_pos_emb(position_embeddings, 13, "pos_emb");
-
-    // Debug: check MROPE output (after apply_multimodal_rotary_pos_emb internal processing)
-    {
-        // Convert to float32 first for proper debugging
-        auto cos = mx::astype(position_embeddings.first, mx::float32);  // [3, B, T, 128]
-        int B_dbg = cos.shape(1);
-        int T_dbg = cos.shape(2);
-
-        std::vector<int> chunk_sizes = {16, 24, 24, 16, 24, 24};
-        mx::Shape split_indices;
-        int cumsum = 0;
-        for (int i = 0; i < 5; ++i) {
-            cumsum += chunk_sizes[i];
-            split_indices.push_back(cumsum);
-        }
-        auto cos_chunks = mx::split(cos, split_indices, 3);
-
-        std::vector<mx::array> cos_parts;
-        for (int i = 0; i < 6; ++i) {
-            int sec = i % 3;
-            int chunk_dim = chunk_sizes[i];
-            auto cos_part = mx::slice(cos_chunks[i], {sec, 0, 0, 0}, {sec + 1, B_dbg, T_dbg, chunk_dim});
-            cos_parts.push_back(mx::squeeze(cos_part, std::vector<int>{0}));
-        }
-        auto cos_cat = mx::concatenate(cos_parts, 2);
-        cos_cat = mx::reshape(cos_cat, {B_dbg, 1, T_dbg, cos_cat.shape(2)});
-        int half = cos_cat.shape(3) / 2;
-        auto cos_half = mx::slice(cos_cat, {0, 0, 0, 0}, {B_dbg, 1, T_dbg, half});
-        cos_half = mx::reshape(cos_half, {B_dbg, 1, T_dbg, half, 1});
-        auto cos_interleaved = mx::tile(cos_half, {1, 1, 1, 1, 2});
-        cos_interleaved = mx::reshape(cos_interleaved, {B_dbg, 1, T_dbg, half * 2});
-        mx::eval(cos_interleaved);
-        auto cpu = mx::copy(cos_interleaved, mx::Device(mx::Device::cpu, 0));
-        mx::eval(cpu);
-        const float* data = cpu.data<float>();
-        int D = cos_interleaved.shape(3);
-        std::cout << "    MROPE cos_interleaved @ token 13, first 10: ";
-        for (int d = 0; d < 10; ++d) std::cout << data[0 * 1 * T_dbg * D + 0 * T_dbg * D + 13 * D + d] << " ";
-        std::cout << std::endl;
-    }
-
-    // Debug: check freqs before cos/sin
-    {
-        int rotary_dim = TEXT_HEAD_DIM;
-        auto inv_idx = mx::astype(mx::arange(0, rotary_dim, 2), mx::float32);
-        auto inv_freq = mx::divide(
-            mx::array(1.0f),
-            mx::power(mx::array(TEXT_ROPE_THETA),
-                      mx::divide(inv_idx, mx::array((float)rotary_dim))));
-        mx::eval(inv_freq);
-        auto inv_cpu = mx::copy(inv_freq, mx::Device(mx::Device::cpu, 0));
-        mx::eval(inv_cpu);
-        std::cout << "    inv_freq first 5: ";
-        for (int i = 0; i < 5; ++i) std::cout << inv_cpu.data<float>()[i] << " ";
-        std::cout << std::endl;
-
-        // Manual freqs at token 13: inv_freq * 13
-        std::cout << "    expected freqs @ token 13, first 5: ";
-        for (int i = 0; i < 5; ++i) std::cout << inv_cpu.data<float>()[i] * 13 << " ";
-        std::cout << std::endl;
-    }
-
-    // Debug: compute Q_rot and K_rot manually
-    {
-        int B = 1, T = 32;
-        auto q_rs = mx::reshape(q, {B, T, TEXT_NUM_HEADS, TEXT_HEAD_DIM});
-        auto k_rs = mx::reshape(k, {B, T, TEXT_KV_HEADS, TEXT_HEAD_DIM});
-        q_rs = mx::transpose(q_rs, {0, 2, 1, 3});  // [B, H, T, D]
-        k_rs = mx::transpose(k_rs, {0, 2, 1, 3});
-
-        auto rotated = apply_multimodal_rotary_pos_emb(q_rs, k_rs, position_embeddings.first, position_embeddings.second);
-        auto q_rot = rotated.first;
-        auto k_rot = rotated.second;
-
-        // Print Q_rot at token 13, head 0, first 10 dims
-        auto q_rot_f32 = mx::astype(q_rot, mx::float32);
-        auto k_rot_f32 = mx::astype(k_rot, mx::float32);
-        mx::eval({q_rot_f32, k_rot_f32});
-        auto q_rot_cpu = mx::copy(q_rot_f32, mx::Device(mx::Device::cpu, 0));
-        auto k_rot_cpu = mx::copy(k_rot_f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval({q_rot_cpu, k_rot_cpu});
-
-        // q_rot shape: [B, H, T, D] = [1, 32, 32, 128]
-        // Access [0, 0, 13, :10]
-        const float* q_data = q_rot_cpu.data<float>();
-        const float* k_data = k_rot_cpu.data<float>();
-        std::cout << "    Q_rot @ token 13, head 0, first 10 dims: ";
-        for (int d = 0; d < 10; ++d) {
-            // Index: [b, h, t, d] = [0, 0, 13, d]
-            // Offset: b * H * T * D + h * T * D + t * D + d = 0 * 32 * 32 * 128 + 0 * 32 * 128 + 13 * 128 + d
-            std::cout << q_data[13 * 128 + d] << " ";
-        }
-        std::cout << std::endl;
-        std::cout << "    K_rot @ token 13, head 0, first 10 dims: ";
-        for (int d = 0; d < 10; ++d) {
-            std::cout << k_data[13 * 128 + d] << " ";
-        }
-        std::cout << std::endl;
-    }
-
-    // 2c: Attention output (before post_self_attn_layernorm)
-    auto attn_out = text_attention_forward(x_norm, &layer0.self_attn, position_embeddings, empty_array());
-    mx::eval(attn_out);
-    print_array_stats("  2c. Attention output (raw)", attn_out);
-    print_first_n(attn_out, 5, "attn_out");
-
-    // 2c': Apply post_self_attn_layernorm to attention output (before residual)
-    auto attn_normed = rms_norm(attn_out, &layer0.post_self_attn_layernorm, TEXT_RMS_EPS);
-    mx::eval(attn_normed);
-    print_array_stats("  2c'. After post_self_attn_layernorm", attn_normed);
-    print_first_n(attn_normed, 5, "attn_normed");
-
-    // 2d: After attention residual
-    auto after_attn = mx::add(embeddings, attn_normed);
-    mx::eval(after_attn);
-    print_array_stats("  2d. After attention residual", after_attn);
-    print_first_n(after_attn, 5, "after_attn");
-
-    // 2e: RMS norm before MLP
-    auto mlp_norm = rms_norm(after_attn, &layer0.post_attention_layernorm, TEXT_RMS_EPS);
-    mx::eval(mlp_norm);
-    print_array_stats("  2e. After post_attn_layernorm", mlp_norm);
-    print_first_n(mlp_norm, 5, "mlp_norm");
-
-    // 2f: MLP gate_up output
-    auto gate_up = fast_linear(mlp_norm, &layer0.mlp.gate_up_proj);
-    mx::eval(gate_up);
-    print_array_stats("  2f. gate_up projection", gate_up);
-    print_first_n(gate_up, 5, "gate_up");
-
-    // 2g: MLP output (before post_mlp_layernorm)
-    auto mlp_out = text_mlp_forward(mlp_norm, &layer0.mlp);
-    mx::eval(mlp_out);
-    print_array_stats("  2g. MLP output (raw)", mlp_out);
-    print_first_n(mlp_out, 5, "mlp_out");
-
-    // 2g': Apply post_mlp_layernorm to MLP output (before residual)
-    auto mlp_normed = rms_norm(mlp_out, &layer0.post_mlp_layernorm, TEXT_RMS_EPS);
-    mx::eval(mlp_normed);
-    print_array_stats("  2g'. After post_mlp_layernorm", mlp_normed);
-    print_first_n(mlp_normed, 5, "mlp_normed");
-
-    // 2h: Full layer output
-    auto layer0_out = mx::add(after_attn, mlp_normed);
-    mx::eval(layer0_out);
-    print_array_stats("  2h. Layer 0 output", layer0_out);
-    print_first_n(layer0_out, 5, "layer0_out");
-
-    // Debug: print values at token 13 (where max diff occurs)
-    auto print_token_dim = [](const mx::array& arr, int token, int dim_start, const std::string& label) {
-        auto f32 = mx::astype(arr, mx::float32);
-        mx::eval(f32);
-        auto cpu = mx::copy(f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval(cpu);
-        const float* data = cpu.data<float>();
-        int D = arr.shape(2);
-        std::cout << "      " << label << " token " << token << ", dims " << dim_start << "-" << (dim_start+4) << ": ";
-        for (int d = dim_start; d < dim_start + 5; ++d) {
-            std::cout << data[token * D + d] << " ";
-        }
-        std::cout << std::endl;
-    };
-    std::cout << "\n  Debug: Values at token 13 (max diff position):" << std::endl;
-    print_token_dim(attn_out, 13, 0, "attn_out (dims 0-4)");
-    print_token_dim(attn_out, 13, 3556, "attn_out (dims 3556-3560)");
-    print_token_dim(attn_normed, 13, 3556, "attn_normed");
-    print_token_dim(after_attn, 13, 3556, "after_attn");
-    print_token_dim(mlp_norm, 13, 3556, "mlp_norm");
-    print_token_dim(mlp_out, 13, 3556, "mlp_out");
-    print_token_dim(mlp_normed, 13, 3556, "mlp_normed");
-    print_token_dim(layer0_out, 13, 3556, "layer0_out");
-
-    // Check where max diff occurs
-    if (expected_layer0.size() > 0) {
-        float layer0_diff = max_abs_diff(layer0_out, expected_layer0);
-        std::cout << "Layer 0 max diff: " << layer0_diff << (layer0_diff < 0.1 ? " [OK]" : " [MISMATCH]") << std::endl;
-
-        // Find the position of max difference
-        auto l0_f32 = mx::astype(layer0_out, mx::float32);
-        auto exp_f32 = mx::astype(expected_layer0, mx::float32);
-        mx::eval({l0_f32, exp_f32});
-        auto l0_cpu = mx::copy(l0_f32, mx::Device(mx::Device::cpu, 0));
-        auto exp_cpu = mx::copy(exp_f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval({l0_cpu, exp_cpu});
-
-        const float* l0_data = l0_cpu.data<float>();
-        const float* exp_data = exp_cpu.data<float>();
-        size_t total = 32 * 4096;  // seq_len * hidden_dim
-        size_t max_idx = 0;
-        float max_d = 0;
-        for (size_t i = 0; i < total; ++i) {
-            float d = std::abs(l0_data[i] - exp_data[i]);
-            if (d > max_d) { max_d = d; max_idx = i; }
-        }
-        int token = max_idx / 4096;
-        int dim = max_idx % 4096;
-        std::cout << "Max diff at token " << token << ", dim " << dim
-                  << ": C++=" << l0_data[max_idx] << ", Python=" << exp_data[max_idx] << std::endl;
-
-        // Print a range around the max diff position
-        std::cout << "Values around max diff (token " << token << ", dims " << std::max(0, dim-2) << "-" << std::min(4095, dim+2) << "):" << std::endl;
-        for (int d = std::max(0, dim-2); d <= std::min(4095, dim+2); ++d) {
-            size_t idx = token * 4096 + d;
-            std::cout << "  dim " << d << ": C++=" << l0_data[idx] << ", Python=" << exp_data[idx] << std::endl;
-        }
-    }
-
-    // Run full forward pass
-    std::cout << "\nRunning full C++ forward pass..." << std::endl;
-    auto hidden_states = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-    mx::eval(hidden_states);
-    mx::synchronize();
-
-    print_array_stats("C++ hidden states", hidden_states);
-
-    // Compare hidden states
-    std::cout << "\n=== Hidden States Comparison ===" << std::endl;
-
-    float max_diff_hidden = max_abs_diff(hidden_states, expected_hidden);
-    float mean_diff_hidden = mean_abs_diff(hidden_states, expected_hidden);
-
-    std::cout << "Max absolute difference: " << max_diff_hidden << std::endl;
-    std::cout << "Mean absolute difference: " << mean_diff_hidden << std::endl;
-
-    // If we have logits, verify those too
-    if (have_logits) {
-        std::cout << "\n=== Logits Comparison ===" << std::endl;
-        auto logits = compute_logits(hidden_states, &model);
-        mx::eval(logits);
-        mx::synchronize();
-
-        print_array_stats("C++ logits", logits);
-
-        float max_diff_logits = max_abs_diff(logits, expected_logits);
-        float mean_diff_logits = mean_abs_diff(logits, expected_logits);
-
-        std::cout << "Max absolute difference: " << max_diff_logits << std::endl;
-        std::cout << "Mean absolute difference: " << mean_diff_logits << std::endl;
-    }
-
-    // Check if within tolerance
-    // For 40-layer float16 model, accumulated precision error is expected
-    // Layer 0 matches closely (~0.001), but error accumulates over layers
-    const float tolerance = 0.5f;  // Reasonable for float16 deep model (40 layers)
-    if (max_diff_hidden < tolerance) {
-        std::cout << "\n[PASS] Hidden states match within tolerance (" << tolerance << ")" << std::endl;
-        return 0;
-    } else {
-        std::cout << "\n[FAIL] Hidden states differ by more than tolerance (" << tolerance << ")" << std::endl;
-
-        // Debug: print first few values
-        std::cout << "\nFirst 10 hidden state values comparison (token 0):" << std::endl;
-        auto out_f32 = mx::astype(hidden_states, mx::float32);
-        auto exp_f32 = mx::astype(expected_hidden, mx::float32);
-        mx::eval({out_f32, exp_f32});
-
-        // Take first token's hidden state
-        auto out_first = mx::reshape(mx::slice(out_f32, {0, 0, 0}, {1, 1, TEXT_DIM}), {TEXT_DIM});
-        auto exp_first = mx::reshape(mx::slice(exp_f32, {0, 0, 0}, {1, 1, TEXT_DIM}), {TEXT_DIM});
-        mx::eval({out_first, exp_first});
-
-        out_first = mx::copy(out_first, mx::Device(mx::Device::cpu, 0));
-        exp_first = mx::copy(exp_first, mx::Device(mx::Device::cpu, 0));
-        mx::eval({out_first, exp_first});
-
-        const float* out_ptr = out_first.data<float>();
-        const float* exp_ptr = exp_first.data<float>();
-
-        std::cout << "  Index\tC++\t\tPython\t\tDiff" << std::endl;
-        for (int i = 0; i < 10; ++i) {
-            std::cout << "  " << i << "\t" << out_ptr[i] << "\t"
-                      << exp_ptr[i] << "\t" << std::abs(out_ptr[i] - exp_ptr[i]) << std::endl;
-        }
-
-        return 1;
-    }
-}
-
-// Step-by-step verification for debugging
-int run_vision_verify_stepwise(const std::string& weights_dir) {
-    std::cout << "=== Step-by-Step Vision Verification ===" << std::endl;
-
-    std::string raw_path = weights_dir + "/vision_encoder.bin";
-    std::string patches_path = weights_dir + "/test_patches.bin";
-
-    // Load model
-    VisionWeights model;
-    if (!load_vision_weights(&model, raw_path)) {
-        return 1;
-    }
-
-    // Load patches
-    int num_patches = 576;
-    auto patches = load_binary_f32(patches_path, {num_patches, PATCH_INPUT_DIM});
-    if (patches.size() == 0) return 1;
-
-    std::vector<GridTHW> grid_thw = {{1, 24, 24}};
-    auto pos = build_vision_position_data(grid_thw);
-
-    // Step 1: Patch embedding
-    std::cout << "\n--- Step 1: Patch Embedding ---" << std::endl;
-    auto x = patch_embed_forward(patches, &model);
-    mx::eval(x);
-    print_array_stats("After patch_embed", x);
-
-    // Load Python intermediate for comparison
-    // (If available from numpy files)
-
-    // Step 2: Post-conv layernorm
-    std::cout << "\n--- Step 2: Post-Conv LayerNorm ---" << std::endl;
-    x = rms_norm(x, &model.post_conv_layernorm, VISION_RMS_EPS);
-    mx::eval(x);
-    print_array_stats("After post_conv_layernorm", x);
-
-    // Step 3: Position embeddings
-    std::cout << "\n--- Step 3: Position Embeddings ---" << std::endl;
-    x = vision_embeddings_forward(x, &model, pos);
-    mx::eval(x);
-    print_array_stats("After position_embeddings", x);
-
-    // Step 4: First transformer block
-    std::cout << "\n--- Step 4: First Transformer Block ---" << std::endl;
-    x = vision_block_forward(x, &model.blocks[0], pos);
-    mx::eval(x);
-    print_array_stats("After block 0", x);
-
-    // Continue through all blocks
-    std::cout << "\n--- Steps 5-27: Remaining Transformer Blocks ---" << std::endl;
-    for (int i = 1; i < NUM_LAYERS; ++i) {
-        x = vision_block_forward(x, &model.blocks[i], pos);
-    }
-    mx::eval(x);
-    print_array_stats("After all blocks", x);
-
-    // Step 28: Post layernorm
-    std::cout << "\n--- Step 28: Post LayerNorm ---" << std::endl;
-    x = rms_norm(x, &model.post_layernorm, VISION_RMS_EPS);
-    mx::eval(x);
-    print_array_stats("After post_layernorm", x);
-
-    // Step 29: Downsample
-    std::cout << "\n--- Step 29: Downsample Conv2d ---" << std::endl;
-    int merge_tokens = x.shape(0) / (SPATIAL_MERGE_SIZE * SPATIAL_MERGE_SIZE);
-    x = mx::reshape(x, {merge_tokens, SPATIAL_MERGE_SIZE, SPATIAL_MERGE_SIZE, VISION_DIM});
-    x = mx::conv2d(x, model.downsample_weight,
-                   {SPATIAL_MERGE_SIZE, SPATIAL_MERGE_SIZE}, {0, 0}, {1, 1}, 1);
-    x = mx::add(x, mx::reshape(model.downsample_bias, {1, 1, 1, MERGE_DIM}));
-    x = mx::reshape(x, {merge_tokens, MERGE_DIM});
-    mx::eval(x);
-    print_array_stats("After downsample", x);
-
-    // Step 30: Merger
-    std::cout << "\n--- Step 30: Merger ---" << std::endl;
-    x = merger_forward(x, &model.merger);
-    mx::eval(x);
-    print_array_stats("Final output", x);
-
-    return 0;
-}
-
-// Comprehensive FP16 stability test
-int run_fp16_stability_test(const std::string& weights_dir) {
-    std::cout << "=== FP16 Stability Test ===" << std::endl;
-
-    // Load text weights
-    std::string text_path = weights_dir + "/text_model.bin";
-    TextModelWeights model;
-    if (!load_text_weights(&model, text_path)) {
-        std::cerr << "Failed to load text weights" << std::endl;
-        return 1;
-    }
-
-    std::cout << "\nTesting with multiple random input sequences...\n" << std::endl;
-
-    const int num_tests = 10;
-    const int seq_len = 64;
-    const int batch_size = 1;
-    int passed = 0;
-    int failed = 0;
-
-    for (int test = 0; test < num_tests; ++test) {
-        // Generate random input_ids with different seeds
-        auto input_ids = mx::random::randint(1000, 10000, {batch_size, seq_len}, mx::int32);
-        auto position_ids = make_default_position_ids(batch_size, seq_len);
-        mx::eval({input_ids, position_ids});
-
-        // Run forward pass
-        auto output = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(output);
-
-        // Check for NaN/Inf
-        auto output_f32 = mx::astype(output, mx::float32);
-        mx::eval(output_f32);
-        auto out_cpu = mx::copy(output_f32, mx::Device(mx::Device::cpu, 0));
-        mx::eval(out_cpu);
-
-        const float* data = out_cpu.data<float>();
-        size_t total = batch_size * seq_len * TEXT_DIM;
-        bool has_nan = false;
-        bool has_inf = false;
-        float min_val = std::numeric_limits<float>::max();
-        float max_val = std::numeric_limits<float>::lowest();
-        double sum = 0;
-
-        for (size_t i = 0; i < total; ++i) {
-            if (std::isnan(data[i])) has_nan = true;
-            if (std::isinf(data[i])) has_inf = true;
-            min_val = std::min(min_val, data[i]);
-            max_val = std::max(max_val, data[i]);
-            sum += data[i];
-        }
-
-        float mean = sum / total;
-        bool stable = !has_nan && !has_inf && std::abs(max_val) < 1e6 && std::abs(min_val) < 1e6;
-
-        std::cout << "Test " << (test + 1) << ": ";
-        if (stable) {
-            std::cout << "[PASS] ";
-            passed++;
-        } else {
-            std::cout << "[FAIL] ";
-            failed++;
-        }
-        std::cout << "min=" << min_val << ", max=" << max_val << ", mean=" << mean;
-        if (has_nan) std::cout << " [NaN detected!]";
-        if (has_inf) std::cout << " [Inf detected!]";
-        std::cout << std::endl;
-    }
-
-    std::cout << "\n=== Summary ===" << std::endl;
-    std::cout << "Passed: " << passed << "/" << num_tests << std::endl;
-    std::cout << "Failed: " << failed << "/" << num_tests << std::endl;
-
-    // Also test with longer sequences
-    std::cout << "\nTesting with longer sequences..." << std::endl;
-    std::vector<int> test_lengths = {128, 256, 512};
-    for (int len : test_lengths) {
-        auto input_ids = mx::random::randint(1000, 10000, {1, len}, mx::int32);
-        auto position_ids = make_default_position_ids(1, len);
-        mx::eval({input_ids, position_ids});
-
-        auto output = text_model_forward_ids(input_ids, &model, position_ids, empty_array());
-        mx::eval(output);
-
-        auto output_f32 = mx::astype(output, mx::float32);
-        mx::eval(output_f32);
-
-        float min_val = mx::min(output_f32).item<float>();
-        float max_val = mx::max(output_f32).item<float>();
-        float mean_val = mx::mean(output_f32).item<float>();
-
-        bool stable = !std::isnan(min_val) && !std::isnan(max_val) &&
-                      std::abs(max_val) < 1e6 && std::abs(min_val) < 1e6;
-
-        std::cout << "  Seq len " << len << ": " << (stable ? "[PASS]" : "[FAIL]")
-                  << " min=" << min_val << ", max=" << max_val << ", mean=" << mean_val << std::endl;
-    }
-
-    return (failed == 0) ? 0 : 1;
-}
-
-// INT8 vs FP16 comparison test
-int run_int8_comparison_test(const std::string& weights_dir) {
-    std::cout << "=== INT8 vs FP16 Comparison Test ===" << std::endl;
-
-    // Load FP16 model
-    std::string fp16_path = weights_dir + "/text_model.bin";
-    TextModelWeights fp16_model;
-    if (!load_text_weights(&fp16_model, fp16_path)) {
-        std::cerr << "Failed to load FP16 text weights" << std::endl;
-        return 1;
-    }
-
-    // Load INT8 model
-    std::string int8_path = weights_dir + "/text_model_int8.bin";
-    QuantizedTextModelWeights int8_model;
-    if (!load_quantized_text_weights(&int8_model, int8_path)) {
-        std::cerr << "Failed to load INT8 text weights" << std::endl;
-        return 1;
-    }
-
-    std::cout << "\nComparing outputs with same input...\n" << std::endl;
-
-    const int num_tests = 5;
-    const int seq_len = 64;
-    const int batch_size = 1;
-
-    double total_max_diff = 0;
-    double total_mean_diff = 0;
-    int passed = 0;
-
-    for (int test = 0; test < num_tests; ++test) {
-        // Generate random input
-        auto input_ids = mx::random::randint(1000, 10000, {batch_size, seq_len}, mx::int32);
-        auto position_ids = make_default_position_ids(batch_size, seq_len);
-        mx::eval({input_ids, position_ids});
-
-        // Run FP16 forward
-        auto fp16_output = text_model_forward_ids(input_ids, &fp16_model, position_ids, empty_array());
-        mx::eval(fp16_output);
-
-        // Run INT8 forward
-        auto int8_output = quantized_text_model_forward_ids(input_ids, &int8_model, position_ids, empty_array());
-        mx::eval(int8_output);
-
-        // Compare outputs
-        float max_diff = max_abs_diff(fp16_output, int8_output);
-        float mean_diff = mean_abs_diff(fp16_output, int8_output);
-
-        total_max_diff += max_diff;
-        total_mean_diff += mean_diff;
-
-        // Allow up to 5% relative error for INT8
-        auto fp16_abs = mx::mean(mx::abs(mx::astype(fp16_output, mx::float32)));
-        mx::eval(fp16_abs);
-        float avg_magnitude = fp16_abs.item<float>();
-        float relative_error = mean_diff / (avg_magnitude + 1e-6);
-
-        bool ok = relative_error < 0.1;  // Allow up to 10% relative error
-        if (ok) passed++;
-
-        std::cout << "Test " << (test + 1) << ": " << (ok ? "[PASS]" : "[FAIL]")
-                  << " max_diff=" << max_diff
-                  << ", mean_diff=" << mean_diff
-                  << ", rel_err=" << (relative_error * 100) << "%" << std::endl;
-    }
-
-    std::cout << "\n=== Summary ===" << std::endl;
-    std::cout << "Passed: " << passed << "/" << num_tests << std::endl;
-    std::cout << "Avg max diff: " << (total_max_diff / num_tests) << std::endl;
-    std::cout << "Avg mean diff: " << (total_mean_diff / num_tests) << std::endl;
-
-    // Also compare with longer sequence
-    std::cout << "\nTesting with seq_len=256..." << std::endl;
-    auto long_input = mx::random::randint(1000, 10000, {1, 256}, mx::int32);
-    auto long_pos = make_default_position_ids(1, 256);
-    mx::eval({long_input, long_pos});
-
-    auto fp16_long = text_model_forward_ids(long_input, &fp16_model, long_pos, empty_array());
-    auto int8_long = quantized_text_model_forward_ids(long_input, &int8_model, long_pos, empty_array());
-    mx::eval({fp16_long, int8_long});
-
-    float long_max_diff = max_abs_diff(fp16_long, int8_long);
-    float long_mean_diff = mean_abs_diff(fp16_long, int8_long);
-    std::cout << "  max_diff=" << long_max_diff << ", mean_diff=" << long_mean_diff << std::endl;
-
-    return (passed >= num_tests - 1) ? 0 : 1;  // Allow 1 failure
-}
-
-int main(int argc, char* argv[]) {
-    const char* force_cpu_env = std::getenv("GLM_FORCE_CPU");
-    bool force_cpu = force_cpu_env && std::string(force_cpu_env) == "1";
-    if (!force_cpu) {
-        auto gpu = mx::Device(mx::Device::gpu, 0);
-        if (mx::is_available(gpu)) {
-            mx::set_default_device(gpu);
-        } else {
-            mx::set_default_device(mx::Device(mx::Device::cpu, 0));
-            std::cout << "GPU not available; using CPU." << std::endl;
-        }
-    } else {
-        mx::set_default_device(mx::Device(mx::Device::cpu, 0));
-        std::cout << "GLM_FORCE_CPU=1; using CPU." << std::endl;
-    }
-
-    // Check for verification mode
-    const char* verify_env = std::getenv("GLM_VERIFY");
-    const char* verify_text_env = std::getenv("GLM_VERIFY_TEXT");
     const char* weights_dir_env = std::getenv("GLM_WEIGHTS_DIR");
 
-    if (verify_env && std::string(verify_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_vision_verify(weights_dir);
-    }
+    // Initialize image config from GLM_IMAGE_SIZE (default: 448)
+    const char* image_size_env = std::getenv("GLM_IMAGE_SIZE");
+    int image_size = image_size_env ? std::atoi(image_size_env) : 448;
+    g_img_cfg = ImageConfig::from_size(image_size);
+    std::cout << "Image configuration:" << std::endl;
+    g_img_cfg.print();
 
-    if (verify_text_env && std::string(verify_text_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_text_verify(weights_dir);
-    }
-
-    const char* verify_448_env = std::getenv("GLM_VERIFY_448");
-    if (verify_448_env && std::string(verify_448_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_vision_verify_448(weights_dir);
-    }
-
-    const char* verify_step_env = std::getenv("GLM_VERIFY_STEP");
-    if (verify_step_env && std::string(verify_step_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_vision_verify_stepwise(weights_dir);
-    }
-
-    const char* fp16_test_env = std::getenv("GLM_FP16_TEST");
-    if (fp16_test_env && std::string(fp16_test_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_fp16_stability_test(weights_dir);
-    }
-
-    const char* int8_test_env = std::getenv("GLM_INT8_TEST");
-    if (int8_test_env && std::string(int8_test_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_int8_comparison_test(weights_dir);
-    }
-
-    const char* int8_bench_env = std::getenv("GLM_INT8_BENCH");
-    if (int8_bench_env && std::string(int8_bench_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_int8_text_bench(weights_dir);
-    }
-
-    const char* dueling_bench_env = std::getenv("GLM_DUELING_BENCH");
-    if (dueling_bench_env && std::string(dueling_bench_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_dueling_bench(weights_dir);
-    }
-
-    const char* inference_env = std::getenv("GLM_INFERENCE");
-    if (inference_env && std::string(inference_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        return run_inference_from_files(weights_dir);
-    }
-
+    // Mode: Precompute embeddings
     const char* precompute_env = std::getenv("GLM_PRECOMPUTE");
     if (precompute_env && std::string(precompute_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
@@ -4847,518 +2938,27 @@ int main(int argc, char* argv[]) {
         return run_precompute_embeddings(input_dir, output_dir, weights_dir, batch_size);
     }
 
-    // Dueling comparison mode: compare two precomputed embeddings
-    // Usage: GLM_DUELING=1 GLM_EMBEDS_DIR=embeddings_512 [GLM_IDX_A=0] [GLM_IDX_B=1] ./glm46v_mlx
-    const char* dueling_env = std::getenv("GLM_DUELING");
-    if (dueling_env && std::string(dueling_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
-        const char* idx_a_env = std::getenv("GLM_IDX_A");
-        const char* idx_b_env = std::getenv("GLM_IDX_B");
-
-        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_512";
-        int idx_a = idx_a_env ? std::atoi(idx_a_env) : -1;  // -1 = random
-        int idx_b = idx_b_env ? std::atoi(idx_b_env) : -1;
-
-        return run_dueling_comparison(embeds_dir, weights_dir, idx_a, idx_b);
-    }
-
-    // Text-only generation mode: for testing parity with Python
-    // Usage: GLM_TEXT_GEN=1 GLM_PROMPT_FILE=vision_weights/text_prompt_test.bin [GLM_MAX_TOKENS=20] ./glm46v_mlx
-    const char* text_gen_env = std::getenv("GLM_TEXT_GEN");
-    if (text_gen_env && std::string(text_gen_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        const char* prompt_file_env = std::getenv("GLM_PROMPT_FILE");
-        const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
-
-        if (!prompt_file_env) {
-            std::cerr << "GLM_PROMPT_FILE is required for text generation mode" << std::endl;
-            return 1;
-        }
-
-        std::string prompt_file = prompt_file_env;
-        int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 20;
-
-        std::cout << "=== Text-Only Generation Mode ===" << std::endl;
-
-        // 1. Load prompt tokens from binary file
-        std::ifstream token_file(prompt_file, std::ios::binary | std::ios::ate);
-        if (!token_file) {
-            std::cerr << "Failed to open prompt file: " << prompt_file << std::endl;
-            return 1;
-        }
-        size_t file_size = token_file.tellg();
-        token_file.seekg(0);
-        int num_tokens = file_size / sizeof(int32_t);
-        std::vector<int32_t> prompt_tokens(num_tokens);
-        token_file.read(reinterpret_cast<char*>(prompt_tokens.data()), file_size);
-        token_file.close();
-
-        std::cout << "Loaded " << num_tokens << " prompt tokens from " << prompt_file << std::endl;
-        std::cout << "First 10: ";
-        for (int i = 0; i < std::min(10, num_tokens); i++) {
-            std::cout << prompt_tokens[i] << " ";
-        }
-        std::cout << std::endl;
-
-        // 2. Load text model
-        std::cout << "\nLoading text model..." << std::endl;
-        TextModelWeights text;
-        if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-            std::cerr << "Failed to load text weights" << std::endl;
-            return 1;
-        }
-
-        // 3. Convert tokens to embeddings
-        auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
-        auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, T, 4096]
-
-        // 4. Create position IDs for text-only input (simple sequential)
-        // For text-only, position_ids shape is [3, B, T] with all dims having same values
-        std::vector<int32_t> pos_data;
-        for (int dim = 0; dim < 3; dim++) {
-            for (int t = 0; t < num_tokens; t++) {
-                pos_data.push_back(t);
-            }
-        }
-        auto position_ids = mx::array(pos_data.data(), {3, 1, num_tokens}, mx::int32);
-
-        // 5. Configure generation
-        GenerationConfig config;
-        config.max_new_tokens = max_tokens;
-
-        // Override sampling config from environment
-        const char* do_sample_env = std::getenv("GLM_DO_SAMPLE");
-        if (do_sample_env) {
-            config.do_sample = std::string(do_sample_env) == "1";
-        }
-        const char* temp_env = std::getenv("GLM_TEMPERATURE");
-        if (temp_env) {
-            config.temperature = std::stof(temp_env);
-        }
-        const char* top_k_env = std::getenv("GLM_TOP_K");
-        if (top_k_env) {
-            config.top_k = std::atoi(top_k_env);
-        }
-        const char* top_p_env = std::getenv("GLM_TOP_P");
-        if (top_p_env) {
-            config.top_p = std::stof(top_p_env);
-        }
-        const char* seed_env = std::getenv("GLM_SEED");
-        if (seed_env) {
-            mx::random::seed(static_cast<uint64_t>(std::atoll(seed_env)));
-            std::cout << "Random seed: " << seed_env << std::endl;
-        }
-
-        std::cout << "Sampling config: do_sample=" << (config.do_sample ? "true" : "false")
-                  << " temp=" << config.temperature
-                  << " top_k=" << config.top_k
-                  << " top_p=" << config.top_p << std::endl;
-
-        // 6. Generate
-        std::cout << "\nGenerating up to " << max_tokens << " tokens..." << std::endl;
-        auto start = std::chrono::high_resolution_clock::now();
-        auto generated_tokens = generate(inputs_embeds, &text, position_ids, config);
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        double tokens_per_sec = generated_tokens.size() / (ms / 1000.0);
-
-        std::cout << "\nGenerated " << generated_tokens.size() << " tokens in "
-                  << std::fixed << std::setprecision(1) << ms << " ms"
-                  << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
-
-        // Output in format parseable by test script
-        std::cout << "\nToken IDs: ";
-        for (size_t i = 0; i < generated_tokens.size(); i++) {
-            std::cout << generated_tokens[i];
-            if (i < generated_tokens.size() - 1) std::cout << " ";
-        }
-        std::cout << std::endl;
-
-        return 0;
-    }
-
-    // Single-image generation mode: for parity testing with Python
-    // Usage: GLM_SINGLE_IMAGE=1 GLM_EMBEDS_DIR=embeddings GLM_IMAGE_IDX=0 [GLM_MAX_TOKENS=20] ./glm46v_mlx
-    const char* single_image_env = std::getenv("GLM_SINGLE_IMAGE");
-    if (single_image_env && std::string(single_image_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
-        const char* idx_env = std::getenv("GLM_IMAGE_IDX");
-        const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
-
-        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings";
-        int image_idx = idx_env ? std::atoi(idx_env) : 0;
-        int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 20;
-
-        std::cout << "=== Single-Image Generation (Parity Test) ===" << std::endl;
-
-        // 1. Load filenames
-        std::string filenames_path = embeds_dir + "/filenames.txt";
-        std::ifstream filenames_file(filenames_path);
-        if (!filenames_file) {
-            std::cerr << "Failed to open " << filenames_path << std::endl;
-            return 1;
-        }
-        std::vector<std::string> filenames;
-        std::string line;
-        while (std::getline(filenames_file, line)) {
-            if (!line.empty()) filenames.push_back(line);
-        }
-        filenames_file.close();
-        int num_images = static_cast<int>(filenames.size());
-        std::cout << "Loaded " << num_images << " image filenames" << std::endl;
-
-        if (image_idx < 0 || image_idx >= num_images) {
-            std::cerr << "Invalid image index: " << image_idx << std::endl;
-            return 1;
-        }
-        std::cout << "Image [" << image_idx << "]: " << filenames[image_idx] << std::endl;
-
-        // 2. Load embedding for this image
-        std::string embeds_path = embeds_dir + "/embeddings.bin";
-        std::ifstream embeds_file(embeds_path, std::ios::binary);
-        if (!embeds_file) {
-            std::cerr << "Failed to open " << embeds_path << std::endl;
-            return 1;
-        }
-
-        const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
-        const size_t bytes_per_image = tokens_per_image * TEXT_DIM * sizeof(uint16_t);
-
-        std::vector<uint16_t> embed_data(tokens_per_image * TEXT_DIM);
-        embeds_file.seekg(image_idx * bytes_per_image);
-        embeds_file.read(reinterpret_cast<char*>(embed_data.data()), bytes_per_image);
-        embeds_file.close();
-
-        // Convert to mx::array (cast to float16_t* like dueling mode does)
-        auto embed_2d = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_data.data()),
-                                  {tokens_per_image, TEXT_DIM}, mx::float16);
-        auto embed_fp16 = mx::expand_dims(embed_2d, 0);  // [1, tokens_per_image, TEXT_DIM]
-
-        // 3. Load prompt tokens (single image prompt)
-        std::string prompt_path = weights_dir + "/single_image_prompt_448.bin";
-        std::ifstream prompt_file(prompt_path, std::ios::binary | std::ios::ate);
-        if (!prompt_file) {
-            std::cerr << "Failed to open " << prompt_path << std::endl;
-            return 1;
-        }
-        size_t prompt_size = prompt_file.tellg();
-        prompt_file.seekg(0);
-        int num_tokens = prompt_size / sizeof(int32_t);
-        std::vector<int32_t> prompt_tokens(num_tokens);
-        prompt_file.read(reinterpret_cast<char*>(prompt_tokens.data()), prompt_size);
-        prompt_file.close();
-        std::cout << "Loaded " << num_tokens << " prompt tokens" << std::endl;
-
-        // 4. Load text model
-        std::cout << "\nLoading text model..." << std::endl;
-        TextModelWeights text;
-        if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-            std::cerr << "Failed to load text weights" << std::endl;
-            return 1;
-        }
-
-        // 5. Build input embeddings: replace image tokens with precomputed embeddings
-        auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
-        auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, T, 4096]
-
-        // Single image config from header
-        constexpr int IMAGE_START = 5;   // SINGLE_IMAGE_START_448
-        constexpr int IMAGE_END = 261;   // SINGLE_IMAGE_END_448
-
-        // Replace image token embeddings
-        auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, IMAGE_START, TEXT_DIM});
-        auto suffix = mx::slice(inputs_embeds, {0, IMAGE_END, 0}, {1, num_tokens, TEXT_DIM});
-        inputs_embeds = mx::concatenate({prefix, embed_fp16, suffix}, 1);
-
-        // 6. Create position IDs
-        std::vector<GridTHW> grids = {{1, PRECOMPUTE_GRID, PRECOMPUTE_GRID}};
-        auto rope = get_rope_index(input_ids, grids, {}, empty_array());
-        auto position_ids = rope.position_ids;
-
-        // Debug: print position IDs if GLM_DEBUG_POSIDS=1
-        const char* debug_posids_env = std::getenv("GLM_DEBUG_POSIDS");
-        if (debug_posids_env && std::string(debug_posids_env) == "1") {
-            mx::eval(position_ids);
-            const int32_t* pos_data = position_ids.data<int32_t>();
-            int T = position_ids.shape(2);
-            std::cout << "\n=== Position IDs (shape: [3, 1, " << T << "]) ===" << std::endl;
-            std::cout << "idx\tt\th\tw" << std::endl;
-            // Print first 25 positions (including first image row)
-            for (int i = 0; i < std::min(25, T); i++) {
-                std::cout << i << "\t" << pos_data[i] << "\t" << pos_data[T + i] << "\t" << pos_data[2*T + i] << std::endl;
-            }
-            std::cout << "..." << std::endl;
-            // Print positions 250-269 (end of image + text after)
-            for (int i = 250; i < std::min(270, T); i++) {
-                std::cout << i << "\t" << pos_data[i] << "\t" << pos_data[T + i] << "\t" << pos_data[2*T + i] << std::endl;
-            }
-            std::cout << "=== End Position IDs ===" << std::endl;
-        }
-
-        // 7. Configure generation
-        GenerationConfig config;
-        config.max_new_tokens = max_tokens;
-
-        // Override sampling config from environment
-        const char* do_sample_env = std::getenv("GLM_DO_SAMPLE");
-        if (do_sample_env) {
-            config.do_sample = std::string(do_sample_env) == "1";
-        }
-        const char* temp_env = std::getenv("GLM_TEMPERATURE");
-        if (temp_env) {
-            config.temperature = std::stof(temp_env);
-        }
-        const char* top_k_env = std::getenv("GLM_TOP_K");
-        if (top_k_env) {
-            config.top_k = std::atoi(top_k_env);
-        }
-        const char* top_p_env = std::getenv("GLM_TOP_P");
-        if (top_p_env) {
-            config.top_p = std::stof(top_p_env);
-        }
-        const char* seed_env = std::getenv("GLM_SEED");
-        if (seed_env) {
-            mx::random::seed(static_cast<uint64_t>(std::atoll(seed_env)));
-            std::cout << "Random seed: " << seed_env << std::endl;
-        }
-
-        std::cout << "\nSampling config: do_sample=" << (config.do_sample ? "true" : "false")
-                  << " temp=" << config.temperature
-                  << " top_k=" << config.top_k
-                  << " top_p=" << config.top_p << std::endl;
-
-        // 8. Generate
-        std::cout << "Generating up to " << max_tokens << " tokens..." << std::endl;
-        auto start = std::chrono::high_resolution_clock::now();
-        auto generated_tokens = generate(inputs_embeds, &text, position_ids, config);
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        double tokens_per_sec = generated_tokens.size() / (ms / 1000.0);
-
-        std::cout << "\nGenerated " << generated_tokens.size() << " tokens in "
-                  << std::fixed << std::setprecision(1) << ms << " ms"
-                  << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
-
-        // Output tokens for comparison
-        std::cout << "\nToken IDs: ";
-        for (size_t i = 0; i < generated_tokens.size(); i++) {
-            std::cout << generated_tokens[i];
-            if (i < generated_tokens.size() - 1) std::cout << " ";
-        }
-        std::cout << std::endl;
-
-        return 0;
-    }
-
-    // Generation mode: multi-token generation with KV cache
-    // Usage: GLM_GENERATE=1 GLM_EMBEDS_DIR=embeddings_512 [GLM_IDX_A=0] [GLM_IDX_B=1] [GLM_MAX_TOKENS=100] ./glm46v_mlx
+    // Generation mode: unified dual-image comparison (single or batched)
+    // Usage: GLM_GENERATE=1 GLM_EMBEDS_DIR=embeddings_out [options] ./glm46v_mlx
+    // Options:
+    //   GLM_IDX_A=N GLM_IDX_B=M  - Single pair (both required)
+    //   GLM_PAIRS_FILE=file     - Load pairs from file (idx_a,idx_b per line)
+    //   GLM_BATCH_SIZE=N        - Number of random pairs (default: 4)
+    //   GLM_MAX_TOKENS=N        - Max tokens to generate (default: 100)
     const char* generate_env = std::getenv("GLM_GENERATE");
     if (generate_env && std::string(generate_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
+        const char* pairs_file_env = std::getenv("GLM_PAIRS_FILE");
         const char* idx_a_env = std::getenv("GLM_IDX_A");
         const char* idx_b_env = std::getenv("GLM_IDX_B");
-        const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
-
-        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_512";
-        int idx_a = idx_a_env ? std::atoi(idx_a_env) : -1;
-        int idx_b = idx_b_env ? std::atoi(idx_b_env) : -1;
-        int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 100;
-
-        std::cout << "=== Multi-Token Generation with KV Cache (448x448) ===" << std::endl;
-
-        // 1. Load filenames
-        std::string filenames_path = embeds_dir + "/filenames.txt";
-        std::ifstream filenames_file(filenames_path);
-        if (!filenames_file) {
-            std::cerr << "Failed to open " << filenames_path << std::endl;
-            return 1;
-        }
-        std::vector<std::string> filenames;
-        std::string line;
-        while (std::getline(filenames_file, line)) {
-            if (!line.empty()) filenames.push_back(line);
-        }
-        filenames_file.close();
-        int num_images = static_cast<int>(filenames.size());
-        std::cout << "Loaded " << num_images << " image filenames" << std::endl;
-
-        // 2. Pick random indices if not specified
-        if (idx_a < 0 || idx_a >= num_images) {
-            std::srand(static_cast<unsigned>(std::time(nullptr)));
-            idx_a = std::rand() % num_images;
-        }
-        if (idx_b < 0 || idx_b >= num_images) {
-            do { idx_b = std::rand() % num_images; } while (idx_b == idx_a);
-        }
-
-        std::cout << "\nComparing:" << std::endl;
-        std::cout << "  A [" << idx_a << "]: " << filenames[idx_a] << std::endl;
-        std::cout << "  B [" << idx_b << "]: " << filenames[idx_b] << std::endl;
-
-        // 3. Load embeddings
-        std::string embeds_path = embeds_dir + "/embeddings.bin";
-        std::ifstream embeds_file(embeds_path, std::ios::binary);
-        if (!embeds_file) {
-            std::cerr << "Failed to open " << embeds_path << std::endl;
-            return 1;
-        }
-
-        const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
-        const size_t bytes_per_image = tokens_per_image * TEXT_DIM * sizeof(uint16_t);
-
-        std::vector<uint16_t> embed_a(tokens_per_image * TEXT_DIM);
-        std::vector<uint16_t> embed_b(tokens_per_image * TEXT_DIM);
-
-        embeds_file.seekg(idx_a * bytes_per_image);
-        embeds_file.read(reinterpret_cast<char*>(embed_a.data()), bytes_per_image);
-        embeds_file.seekg(idx_b * bytes_per_image);
-        embeds_file.read(reinterpret_cast<char*>(embed_b.data()), bytes_per_image);
-        embeds_file.close();
-
-        // 4. Load prompt tokens
-        std::string tokens_path = weights_dir + "/dueling_prompt_tokens_448.bin";
-        std::ifstream tokens_file(tokens_path, std::ios::binary);
-        if (!tokens_file) {
-            std::cerr << "Failed to open " << tokens_path << std::endl;
-            return 1;
-        }
-        tokens_file.seekg(0, std::ios::end);
-        int num_tokens = tokens_file.tellg() / sizeof(int32_t);
-        tokens_file.seekg(0, std::ios::beg);
-        std::vector<int32_t> prompt_tokens(num_tokens);
-        tokens_file.read(reinterpret_cast<char*>(prompt_tokens.data()), num_tokens * sizeof(int32_t));
-        tokens_file.close();
-        std::cout << "Loaded " << num_tokens << " prompt tokens" << std::endl;
-
-        // 5. Load text model
-        std::cout << "Loading text model..." << std::endl;
-        TextModelWeights text;
-        if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-            std::cerr << "Failed to load text weights" << std::endl;
-            return 1;
-        }
-
-        // 6. Build input embeddings
-        auto img_a = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_a.data()),
-                               {tokens_per_image, TEXT_DIM}, mx::float16);
-        auto img_b = mx::array(reinterpret_cast<const mlx::core::float16_t*>(embed_b.data()),
-                               {tokens_per_image, TEXT_DIM}, mx::float16);
-
-        auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
-        auto inputs_embeds = mx::take(text.embed_tokens, input_ids, 0);
-
-        // Replace image tokens with vision embeddings
-        auto img_a_batched = mx::expand_dims(img_a, 0);
-        auto img_b_batched = mx::expand_dims(img_b, 0);
-
-        auto prefix = mx::slice(inputs_embeds, {0, 0, 0}, {1, DUELING_IMAGE_A_START_448, TEXT_DIM});
-        auto mid = mx::slice(inputs_embeds, {0, DUELING_IMAGE_A_END_448, 0}, {1, DUELING_IMAGE_B_START_448, TEXT_DIM});
-        auto suffix = mx::slice(inputs_embeds, {0, DUELING_IMAGE_B_END_448, 0}, {1, num_tokens, TEXT_DIM});
-
-        inputs_embeds = mx::concatenate({prefix, img_a_batched, mid, img_b_batched, suffix}, 1);
-
-        // 7. Create position IDs
-        std::vector<GridTHW> grids = {
-            {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID},
-            {1, PRECOMPUTE_GRID, PRECOMPUTE_GRID}
-        };
-        auto rope = get_rope_index(input_ids, grids, {}, empty_array());
-        auto position_ids = rope.position_ids;
-
-        std::cout << "\nGenerating up to " << max_tokens << " tokens..." << std::endl;
-
-        // 8. Generate with KV cache
-        GenerationConfig config;
-        config.max_new_tokens = max_tokens;
-
-        // Override sampling config from environment
-        const char* do_sample_env = std::getenv("GLM_DO_SAMPLE");
-        if (do_sample_env) {
-            config.do_sample = std::string(do_sample_env) == "1";
-        }
-        const char* temp_env = std::getenv("GLM_TEMPERATURE");
-        if (temp_env) {
-            config.temperature = std::stof(temp_env);
-        }
-        const char* top_k_env = std::getenv("GLM_TOP_K");
-        if (top_k_env) {
-            config.top_k = std::atoi(top_k_env);
-        }
-        const char* top_p_env = std::getenv("GLM_TOP_P");
-        if (top_p_env) {
-            config.top_p = std::stof(top_p_env);
-        }
-        const char* rep_penalty_env = std::getenv("GLM_REP_PENALTY");
-        if (rep_penalty_env) {
-            config.repetition_penalty = std::stof(rep_penalty_env);
-        }
-        const char* seed_env = std::getenv("GLM_SEED");
-        if (seed_env) {
-            mx::random::seed(static_cast<uint64_t>(std::atoll(seed_env)));
-            std::cout << "Random seed: " << seed_env << std::endl;
-        }
-
-        std::cout << "Sampling config: do_sample=" << (config.do_sample ? "true" : "false")
-                  << " temp=" << config.temperature
-                  << " top_k=" << config.top_k
-                  << " top_p=" << config.top_p
-                  << " rep_penalty=" << config.repetition_penalty << std::endl;
-
-        auto start = std::chrono::high_resolution_clock::now();
-        auto generated_tokens = generate(inputs_embeds, &text, position_ids, config);
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        double tokens_per_sec = (generated_tokens.size()) / (ms / 1000.0);
-
-        std::cout << "\nGenerated " << generated_tokens.size() << " tokens in "
-                  << std::fixed << std::setprecision(1) << ms << " ms"
-                  << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
-
-        std::cout << "\nToken IDs: ";
-        for (size_t i = 0; i < generated_tokens.size(); i++) {
-            std::cout << generated_tokens[i];
-            if (i < generated_tokens.size() - 1) std::cout << " ";
-        }
-        std::cout << std::endl;
-
-        // Print special tokens
-        std::cout << "\nToken analysis:" << std::endl;
-        for (size_t i = 0; i < generated_tokens.size(); i++) {
-            int32_t tok = generated_tokens[i];
-            if (tok == 151329) std::cout << "  [" << i << "] EOS token" << std::endl;
-            else if (tok == 151346) std::cout << "  [" << i << "] <think>" << std::endl;
-            else if (tok == 151347) std::cout << "  [" << i << "] </think>" << std::endl;
-            else if (tok >= 65 && tok <= 90) std::cout << "  [" << i << "] '" << static_cast<char>(tok) << "'" << std::endl;
-            else if (tok >= 97 && tok <= 122) std::cout << "  [" << i << "] '" << static_cast<char>(tok) << "'" << std::endl;
-        }
-
-        return 0;
-    }
-
-    // Batched generation mode: process multiple image pairs in parallel
-    // Usage: GLM_BATCH_GENERATE=1 GLM_EMBEDS_DIR=embeddings_512 [GLM_BATCH_SIZE=4] [GLM_PAIRS_FILE=pairs.txt] [GLM_MAX_TOKENS=100] ./glm46v_mlx
-    // pairs.txt format: idx_a,idx_b per line (e.g., "0,1\n2,3\n...")
-    // Without pairs file: generates random pairs
-    const char* batch_generate_env = std::getenv("GLM_BATCH_GENERATE");
-    if (batch_generate_env && std::string(batch_generate_env) == "1") {
-        std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
-        const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
         const char* batch_size_env = std::getenv("GLM_BATCH_SIZE");
-        const char* pairs_file_env = std::getenv("GLM_PAIRS_FILE");
         const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
 
-        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_512";
-        int batch_size = batch_size_env ? std::atoi(batch_size_env) : 4;
+        std::string embeds_dir = embeds_dir_env ? embeds_dir_env : "embeddings_out";
         int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 100;
 
-        std::cout << "=== Batched Multi-Token Generation (448x448) ===" << std::endl;
-        std::cout << "Batch size: " << batch_size << std::endl;
+        std::cout << "=== Dual-Image Comparison Generation (448x448) ===" << std::endl;
 
         // 1. Load filenames
         std::string filenames_path = embeds_dir + "/filenames.txt";
@@ -5381,17 +2981,19 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // 2. Determine pairs to compare
+        // 2. Determine pairs to compare (unified logic)
         std::vector<std::pair<int, int>> pairs;
+
         if (pairs_file_env) {
             // Load pairs from file
+            int max_pairs = batch_size_env ? std::atoi(batch_size_env) : 64;
             std::ifstream pairs_file(pairs_file_env);
             if (!pairs_file) {
                 std::cerr << "Failed to open pairs file: " << pairs_file_env << std::endl;
                 return 1;
             }
             std::string pair_line;
-            while (std::getline(pairs_file, pair_line) && static_cast<int>(pairs.size()) < batch_size) {
+            while (std::getline(pairs_file, pair_line) && static_cast<int>(pairs.size()) < max_pairs) {
                 size_t comma = pair_line.find(',');
                 if (comma != std::string::npos) {
                     int idx_a = std::atoi(pair_line.substr(0, comma).c_str());
@@ -5403,8 +3005,21 @@ int main(int argc, char* argv[]) {
             }
             pairs_file.close();
             std::cout << "Loaded " << pairs.size() << " pairs from " << pairs_file_env << std::endl;
+        } else if (idx_a_env && idx_b_env) {
+            // Single explicit pair (both must be set)
+            int idx_a = std::atoi(idx_a_env);
+            int idx_b = std::atoi(idx_b_env);
+            if (idx_a >= 0 && idx_a < num_images && idx_b >= 0 && idx_b < num_images) {
+                pairs.push_back({idx_a, idx_b});
+                std::cout << "Using explicit pair: A=" << idx_a << ", B=" << idx_b << std::endl;
+            } else {
+                std::cerr << "Invalid indices: idx_a=" << idx_a << ", idx_b=" << idx_b
+                          << " (num_images=" << num_images << ")" << std::endl;
+                return 1;
+            }
         } else {
-            // Generate random pairs
+            // Generate random pairs (default: 4)
+            int batch_size = batch_size_env ? std::atoi(batch_size_env) : 4;
             std::srand(static_cast<unsigned>(std::time(nullptr)));
             for (int i = 0; i < batch_size; ++i) {
                 int idx_a = std::rand() % num_images;
@@ -5416,7 +3031,12 @@ int main(int argc, char* argv[]) {
         }
 
         int B = static_cast<int>(pairs.size());
-        std::cout << "\nComparing " << B << " pairs:" << std::endl;
+        if (B == 0) {
+            std::cerr << "No valid pairs to process" << std::endl;
+            return 1;
+        }
+
+        std::cout << "\nComparing " << B << " pair" << (B > 1 ? "s" : "") << ":" << std::endl;
         for (int i = 0; i < B; ++i) {
             std::cout << "  [" << i << "] A=" << pairs[i].first << " (" << filenames[pairs[i].first] << ")"
                       << " vs B=" << pairs[i].second << " (" << filenames[pairs[i].second] << ")" << std::endl;
@@ -5430,7 +3050,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
+        const int tokens_per_image = g_img_cfg.tokens_per_image;
         const size_t bytes_per_image = tokens_per_image * TEXT_DIM * sizeof(uint16_t);
 
         std::vector<std::vector<uint16_t>> embeds_a(B, std::vector<uint16_t>(tokens_per_image * TEXT_DIM));
@@ -5443,7 +3063,6 @@ int main(int argc, char* argv[]) {
             embeds_file.read(reinterpret_cast<char*>(embeds_b[i].data()), bytes_per_image);
         }
         embeds_file.close();
-        std::cout << "Loaded embeddings for " << B << " pairs" << std::endl;
 
         // 4. Load prompt tokens
         std::string tokens_path = weights_dir + "/dueling_prompt_tokens_448.bin";
@@ -5469,15 +3088,13 @@ int main(int argc, char* argv[]) {
         }
 
         // 6. Build batched input embeddings
-        // Each sequence: [prefix][img_a][mid][img_b][suffix]
-        // Total seq_len = num_tokens (prompt with placeholders replaced)
         auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
         auto base_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
 
         // Pre-extract prefix, mid, suffix (shared across batch)
-        auto prefix = mx::slice(base_embeds, {0, 0, 0}, {1, DUELING_IMAGE_A_START_448, TEXT_DIM});
-        auto mid = mx::slice(base_embeds, {0, DUELING_IMAGE_A_END_448, 0}, {1, DUELING_IMAGE_B_START_448, TEXT_DIM});
-        auto suffix = mx::slice(base_embeds, {0, DUELING_IMAGE_B_END_448, 0}, {1, num_tokens, TEXT_DIM});
+        auto prefix = mx::slice(base_embeds, {0, 0, 0}, {1, g_img_cfg.image_a_start, TEXT_DIM});
+        auto mid = mx::slice(base_embeds, {0, g_img_cfg.image_a_end, 0}, {1, g_img_cfg.image_b_start, TEXT_DIM});
+        auto suffix = mx::slice(base_embeds, {0, g_img_cfg.image_b_end, 0}, {1, num_tokens, TEXT_DIM});
 
         // Build batched sequences
         std::vector<mx::array> batch_sequences;
@@ -5497,19 +3114,14 @@ int main(int argc, char* argv[]) {
         std::cout << "Input embeddings shape: [" << B << ", " << seq_len << ", " << TEXT_DIM << "]" << std::endl;
 
         // 7. Create batched position IDs
-        // Replicate input_ids for batch
         auto batched_input_ids = mx::broadcast_to(input_ids, {B, num_tokens});
-
         std::vector<GridTHW> grids;
         for (int i = 0; i < B; ++i) {
-            grids.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});
-            grids.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});
+            grids.push_back({1, g_img_cfg.grid, g_img_cfg.grid});
+            grids.push_back({1, g_img_cfg.grid, g_img_cfg.grid});
         }
         auto rope = get_rope_index(batched_input_ids, grids, {}, empty_array());
         auto position_ids = rope.position_ids;
-
-        std::cout << "Position IDs shape: [" << position_ids.shape(0) << ", "
-                  << position_ids.shape(1) << ", " << position_ids.shape(2) << "]" << std::endl;
 
         // 8. Configure generation
         GenerationConfig config;
@@ -5547,8 +3159,8 @@ int main(int argc, char* argv[]) {
                   << " top_p=" << config.top_p
                   << " rep_penalty=" << config.repetition_penalty << std::endl;
 
-        // 9. Batched generation
-        std::cout << "\nGenerating up to " << max_tokens << " tokens for " << B << " sequences..." << std::endl;
+        // 9. Generate (use batched infrastructure for all cases)
+        std::cout << "\nGenerating up to " << max_tokens << " tokens for " << B << " sequence" << (B > 1 ? "s" : "") << "..." << std::endl;
 
         auto start = std::chrono::high_resolution_clock::now();
         auto all_generated = generate_batched(inputs_embeds, &text, position_ids, config);
@@ -5561,12 +3173,12 @@ int main(int argc, char* argv[]) {
         }
         double tokens_per_sec = total_tokens / (ms / 1000.0);
 
+        // 10. Output results
         std::cout << "\n=== Results ===" << std::endl;
         std::cout << "Generated " << total_tokens << " total tokens in "
                   << std::fixed << std::setprecision(1) << ms << " ms"
                   << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
 
-        // Print results for each pair
         for (int i = 0; i < B; ++i) {
             std::cout << "\n--- Pair " << i << " (A=" << pairs[i].first << " vs B=" << pairs[i].second << ") ---" << std::endl;
             std::cout << "Generated " << all_generated[i].size() << " tokens" << std::endl;
@@ -5577,10 +3189,12 @@ int main(int argc, char* argv[]) {
             }
             std::cout << std::endl;
 
-            // Simple token analysis
+            // Token analysis
             for (size_t j = 0; j < all_generated[i].size(); ++j) {
                 int32_t tok = all_generated[i][j];
                 if (tok == 151329) std::cout << "  [" << j << "] EOS" << std::endl;
+                else if (tok == 151346) std::cout << "  [" << j << "] <think>" << std::endl;
+                else if (tok == 151347) std::cout << "  [" << j << "] </think>" << std::endl;
                 else if (tok >= 65 && tok <= 90) std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
                 else if (tok >= 97 && tok <= 122) std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
             }
@@ -5589,16 +3203,16 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Batched single-image description mode: process multiple images in parallel for annotation/description
-    // Usage: GLM_BATCH_SINGLE_IMAGE=1 GLM_EMBEDS_DIR=embeddings_out [GLM_BATCH_SIZE=64] [GLM_INDICES_FILE=indices.txt] [GLM_MAX_TOKENS=100] ./glm46v_mlx
-    // indices.txt format: one index per line
-    // Without indices file: uses first B images (or random if GLM_RANDOM_INDICES=1)
-    const char* batch_single_env = std::getenv("GLM_BATCH_SINGLE_IMAGE");
-    if (batch_single_env && std::string(batch_single_env) == "1") {
+    // Description mode: single-image description (single or batched)
+    // Usage: GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeddings_out [GLM_IDX=N | GLM_BATCH_SIZE=64 | GLM_INDICES_FILE=indices.txt] [GLM_MAX_TOKENS=100] ./glm46v_mlx
+    // Priority: GLM_INDICES_FILE > GLM_IDX > GLM_RANDOM_INDICES > first N images
+    const char* describe_env = std::getenv("GLM_DESCRIBE");
+    if (describe_env && std::string(describe_env) == "1") {
         std::string weights_dir = weights_dir_env ? weights_dir_env : "vision_weights";
         const char* embeds_dir_env = std::getenv("GLM_EMBEDS_DIR");
         const char* batch_size_env = std::getenv("GLM_BATCH_SIZE");
         const char* indices_file_env = std::getenv("GLM_INDICES_FILE");
+        const char* idx_env = std::getenv("GLM_IDX");
         const char* max_tokens_env = std::getenv("GLM_MAX_TOKENS");
         const char* random_indices_env = std::getenv("GLM_RANDOM_INDICES");
 
@@ -5607,7 +3221,7 @@ int main(int argc, char* argv[]) {
         int max_tokens = max_tokens_env ? std::atoi(max_tokens_env) : 100;
         bool random_indices = random_indices_env && std::string(random_indices_env) == "1";
 
-        std::cout << "=== Batched Single-Image Description (448x448) ===" << std::endl;
+        std::cout << "=== Image Description Mode (448x448) ===" << std::endl;
         std::cout << "Batch size: " << batch_size << std::endl;
 
         // 1. Load filenames
@@ -5632,6 +3246,7 @@ int main(int argc, char* argv[]) {
         }
 
         // 2. Determine indices to process
+        // Priority: GLM_INDICES_FILE > GLM_IDX > GLM_RANDOM_INDICES > first N images
         std::vector<int> indices;
         if (indices_file_env) {
             // Load indices from file
@@ -5651,6 +3266,16 @@ int main(int argc, char* argv[]) {
             }
             indices_file.close();
             std::cout << "Loaded " << indices.size() << " indices from " << indices_file_env << std::endl;
+        } else if (idx_env) {
+            // Single explicit index
+            int idx = std::atoi(idx_env);
+            if (idx >= 0 && idx < num_images) {
+                indices.push_back(idx);
+                std::cout << "Using single image index: " << idx << std::endl;
+            } else {
+                std::cerr << "GLM_IDX=" << idx << " is out of range [0, " << num_images - 1 << "]" << std::endl;
+                return 1;
+            }
         } else if (random_indices) {
             // Generate random indices
             std::srand(static_cast<unsigned>(std::time(nullptr)));
@@ -5687,7 +3312,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        const int tokens_per_image = PRECOMPUTE_TOKENS;  // 256
+        const int tokens_per_image = g_img_cfg.tokens_per_image;
         const size_t bytes_per_image = tokens_per_image * TEXT_DIM * sizeof(uint16_t);
 
         std::vector<std::vector<uint16_t>> embeds(B, std::vector<uint16_t>(tokens_per_image * TEXT_DIM));
@@ -5723,16 +3348,16 @@ int main(int argc, char* argv[]) {
         }
 
         // 6. Build batched input embeddings
-        // Single image layout: [prefix:5][image:256][suffix:~9] = ~270 tokens
-        constexpr int IMAGE_START = 5;   // SINGLE_IMAGE_START_448
-        constexpr int IMAGE_END = 261;   // SINGLE_IMAGE_END_448
+        // Single image layout: [prefix:5][image:tokens][suffix:~9]
+        const int image_start = g_img_cfg.image_start;
+        const int image_end = g_img_cfg.image_end;
 
         auto input_ids = mx::array(prompt_tokens.data(), {1, num_tokens}, mx::int32);
         auto base_embeds = mx::take(text.embed_tokens, input_ids, 0);  // [1, seq_len, dim]
 
         // Pre-extract prefix and suffix (shared across batch)
-        auto prefix = mx::slice(base_embeds, {0, 0, 0}, {1, IMAGE_START, TEXT_DIM});
-        auto suffix = mx::slice(base_embeds, {0, IMAGE_END, 0}, {1, num_tokens, TEXT_DIM});
+        auto prefix = mx::slice(base_embeds, {0, 0, 0}, {1, image_start, TEXT_DIM});
+        auto suffix = mx::slice(base_embeds, {0, image_end, 0}, {1, num_tokens, TEXT_DIM});
 
         // Build batched sequences
         std::vector<mx::array> batch_sequences;
@@ -5755,7 +3380,7 @@ int main(int argc, char* argv[]) {
 
         std::vector<GridTHW> grids;
         for (int i = 0; i < B; ++i) {
-            grids.push_back({1, PRECOMPUTE_GRID, PRECOMPUTE_GRID});  // One grid per image
+            grids.push_back({1, g_img_cfg.grid, g_img_cfg.grid});  // One grid per image
         }
         auto rope = get_rope_index(batched_input_ids, grids, {}, empty_array());
         auto position_ids = rope.position_ids;
@@ -5841,15 +3466,49 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Original benchmark modes
-    bool run_text = (GLM_RUN_TEXT != 0);
-    const char* run_text_env = std::getenv("GLM_RUN_TEXT");
-    if (run_text_env && std::string(run_text_env) == "1") {
-        run_text = true;
-    }
+    // No mode specified - print usage
+    std::cout << "GLM-4V MLX Inference Engine\n\n";
+    std::cout << "Usage: Set one of the following environment variables:\n\n";
+    std::cout << "Modes:\n";
+    std::cout << "  GLM_PRECOMPUTE=1         Precompute vision embeddings from images\n";
+    std::cout << "  GLM_GENERATE=1           Dual-image comparison (single or batched)\n";
+    std::cout << "  GLM_DESCRIBE=1           Single-image description (single or batched)\n\n";
+    std::cout << "GLM_GENERATE options:\n";
+    std::cout << "  GLM_IDX_A=N GLM_IDX_B=M  Single pair (both required for single mode)\n";
+    std::cout << "  GLM_PAIRS_FILE=path      Load pairs from file (idx_a,idx_b per line)\n";
+    std::cout << "  GLM_BATCH_SIZE=N         Number of random pairs (default: 4)\n\n";
+    std::cout << "GLM_DESCRIBE options:\n";
+    std::cout << "  GLM_IDX=N                Single explicit image index\n";
+    std::cout << "  GLM_INDICES_FILE=path    Load indices from file (one per line)\n";
+    std::cout << "  GLM_RANDOM_INDICES=1     Use random indices instead of first N\n";
+    std::cout << "  GLM_BATCH_SIZE=N         Number of images (default: 64)\n\n";
+    std::cout << "Common options:\n";
+    std::cout << "  GLM_IMAGE_SIZE=N         Image size in pixels (default: 448, also: 336)\n";
+    std::cout << "  GLM_WEIGHTS_DIR=path     Model weights directory (default: vision_weights)\n";
+    std::cout << "  GLM_EMBEDS_DIR=path      Embeddings directory (default: embeddings_out)\n";
+    std::cout << "  GLM_MAX_TOKENS=N         Max tokens to generate (default: 100)\n\n";
+    std::cout << "Sampling options:\n";
+    std::cout << "  GLM_DO_SAMPLE=1          Enable sampling (default: greedy)\n";
+    std::cout << "  GLM_TEMPERATURE=0.8      Temperature for sampling\n";
+    std::cout << "  GLM_TOP_K=50             Top-K sampling\n";
+    std::cout << "  GLM_TOP_P=0.9            Top-P (nucleus) sampling\n";
+    std::cout << "  GLM_REP_PENALTY=1.1      Repetition penalty\n";
+    std::cout << "  GLM_SEED=N               Random seed\n\n";
+    std::cout << "Examples:\n";
+    std::cout << "  # Precompute embeddings\n";
+    std::cout << "  GLM_PRECOMPUTE=1 GLM_INPUT_DIR=images GLM_OUTPUT_DIR=embeds ./glm46v_mlx\n\n";
+    std::cout << "  # Default: 4 random pairs\n";
+    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx\n\n";
+    std::cout << "  # Single explicit pair\n";
+    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_IDX_A=0 GLM_IDX_B=1 ./glm46v_mlx\n\n";
+    std::cout << "  # Custom batch size (8 random pairs)\n";
+    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_BATCH_SIZE=8 ./glm46v_mlx\n\n";
+    std::cout << "  # Load pairs from file\n";
+    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_PAIRS_FILE=pairs.txt ./glm46v_mlx\n\n";
+    std::cout << "  # Describe first 64 images\n";
+    std::cout << "  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx\n\n";
+    std::cout << "  # Describe single image by index\n";
+    std::cout << "  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds GLM_IDX=5 ./glm46v_mlx\n";
 
-    if (run_text) {
-        return run_text_bench();
-    }
-    return run_vision_bench();
+    return 0;
 }
