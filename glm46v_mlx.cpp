@@ -2795,6 +2795,11 @@ int run_precompute_embeddings(const std::string& input_dir,
     auto start_time = std::chrono::steady_clock::now();
     int buf_idx = 0;
 
+    // Accumulate multiple batches before writing to disk to reduce sync overhead
+    std::vector<mx::array> pending_embeddings;
+    std::vector<std::string> pending_paths;
+    const int FLUSH_EVERY_N_BATCHES = 4;  // Tune based on memory
+
     while (true) {
         // Wait for buffer to be ready
         {
@@ -2832,7 +2837,7 @@ int run_precompute_embeddings(const std::string& input_dir,
         // Run compiled vision encoder (uses fixed batch_size grid_thw)
         auto result = compiled_vision({padded_patches});
         auto embeddings = result[0];
-        mx::eval(embeddings);
+        // .data<>() implicitly evals - no need for explicit eval calls
 
         // Slice to actual batch size if we padded
         // embeddings shape: [batch_size * tokens_per_image, TEXT_DIM]
@@ -2846,19 +2851,34 @@ int run_precompute_embeddings(const std::string& input_dir,
         // Reshape to [B, tokens_per_image, TEXT_DIM]
         embeddings = mx::reshape(embeddings, {B, g_img_cfg.tokens_per_image, TEXT_DIM});
 
-        // Convert to float16 and write
+        // Accumulate instead of immediate write
         auto emb_fp16 = mx::astype(embeddings, mx::float16);
-        mx::eval(emb_fp16);
-        const uint16_t* emb_data = emb_fp16.data<uint16_t>();
-        size_t emb_bytes = static_cast<size_t>(B) * g_img_cfg.tokens_per_image * TEXT_DIM * sizeof(uint16_t);
-        emb_out.write(reinterpret_cast<const char*>(emb_data), emb_bytes);
-
-        // Write filenames
-        for (const auto& path : buf.paths) {
-            names_out << path << "\n";
-        }
+        mx::eval(emb_fp16);  // Force eval to keep computation graph small
+        pending_embeddings.push_back(emb_fp16);
+        pending_paths.insert(pending_paths.end(), buf.paths.begin(), buf.paths.end());
 
         images_processed += B;
+
+        // Flush when accumulated enough batches
+        bool should_flush = static_cast<int>(pending_embeddings.size()) >= FLUSH_EVERY_N_BATCHES;
+        if (should_flush) {
+            // Concatenate all pending embeddings (already fp16)
+            auto combined = (pending_embeddings.size() == 1)
+                ? pending_embeddings[0]
+                : mx::concatenate(pending_embeddings, 0);
+            // Single eval for all accumulated batches
+            mx::eval(combined);
+            const uint16_t* data = combined.data<uint16_t>();
+            size_t bytes = static_cast<size_t>(combined.shape(0)) * combined.shape(1) * combined.shape(2) * sizeof(uint16_t);
+            emb_out.write(reinterpret_cast<const char*>(data), bytes);
+
+            for (const auto& path : pending_paths) {
+                names_out << path << "\n";
+            }
+
+            pending_embeddings.clear();
+            pending_paths.clear();
+        }
 
         // Progress
         auto now = std::chrono::steady_clock::now();
@@ -2875,6 +2895,20 @@ int run_precompute_embeddings(const std::string& input_dir,
         }
         cv.notify_all();
         buf_idx = 1 - buf_idx;
+    }
+
+    // Flush any remaining accumulated embeddings
+    if (!pending_embeddings.empty()) {
+        auto combined = (pending_embeddings.size() == 1)
+            ? pending_embeddings[0]
+            : mx::concatenate(pending_embeddings, 0);
+        mx::eval(combined);
+        const uint16_t* data = combined.data<uint16_t>();
+        size_t bytes = static_cast<size_t>(combined.shape(0)) * combined.shape(1) * combined.shape(2) * sizeof(uint16_t);
+        emb_out.write(reinterpret_cast<const char*>(data), bytes);
+        for (const auto& path : pending_paths) {
+            names_out << path << "\n";
+        }
     }
 
     loader_thread.join();
