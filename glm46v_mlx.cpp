@@ -782,7 +782,11 @@ constexpr int REP_PENALTY_WINDOW = 64;
 // Helper: Apply repetition penalty to logits using sliding window
 // logits: [B, vocab_size], generated_tokens: per-batch token history
 // Returns logits with penalty applied to recently generated tokens
-// Uses a hybrid CPU/GPU approach: builds penalty mask on CPU, applies on GPU
+//
+// OPTIMIZED: Pure GPU sparse implementation using scatter_add
+// - No mx::eval() sync (preserves lazy evaluation pipeline)
+// - Only transfers ~4KB of indices to GPU (vs 4.8MB for dense mask)
+// - All compute stays on GPU via gather → compute → scatter_add
 mx::array apply_repetition_penalty_batched(
     mx::array logits,
     const std::vector<std::vector<int32_t>>& generated_tokens,
@@ -791,34 +795,61 @@ mx::array apply_repetition_penalty_batched(
     int B = logits.shape(0);
     int vocab_size = logits.shape(1);
 
-    // Evaluate logits once to access data
-    mx::eval(logits);
+    // Step 1: Build sparse penalty indices on CPU (no GPU sync needed)
+    // Max size: B * REP_PENALTY_WINDOW = 8 * 64 = 512 entries = ~2KB
+    std::vector<int32_t> linear_indices;
+    linear_indices.reserve(B * REP_PENALTY_WINDOW);
 
-    // Copy logits to CPU for modification
-    std::vector<float> logits_data(B * vocab_size);
-    std::memcpy(logits_data.data(), logits.data<float>(), B * vocab_size * sizeof(float));
-
-    // Apply penalty per batch element using sliding window
     for (int b = 0; b < B && b < static_cast<int>(generated_tokens.size()); ++b) {
         const auto& hist = generated_tokens[b];
         if (hist.empty()) continue;
 
-        // Only consider last REP_PENALTY_WINDOW tokens
         int start = std::max(0, static_cast<int>(hist.size()) - REP_PENALTY_WINDOW);
         for (int i = start; i < static_cast<int>(hist.size()); ++i) {
             int32_t tok = hist[i];
             if (tok >= 0 && tok < vocab_size) {
-                float& val = logits_data[b * vocab_size + tok];
-                if (val > 0) {
-                    val /= penalty;
-                } else {
-                    val *= penalty;
-                }
+                linear_indices.push_back(b * vocab_size + tok);
             }
         }
     }
 
-    return mx::array(logits_data.data(), {B, vocab_size}, mx::float32);
+    // Early exit if no penalties to apply
+    if (linear_indices.empty()) {
+        return logits;
+    }
+
+    int N = static_cast<int>(linear_indices.size());
+
+    // Step 2: Create GPU index array (~2KB transfer)
+    auto idx = mx::array(linear_indices.data(), {N}, mx::int32);
+
+    // Step 3: Flatten logits and gather values at penalty positions (GPU, lazy)
+    auto logits_flat = mx::reshape(logits, {B * vocab_size});
+    auto vals = mx::take(logits_flat, idx, 0);  // [N]
+
+    // Step 4: Compute penalized values on GPU (lazy)
+    // Formula: if val > 0, divide by penalty; else multiply by penalty
+    // Equivalent to: val / (penalty if val > 0 else 1/penalty)
+    auto is_positive = mx::greater(vals, mx::array(0.0f, vals.dtype()));
+    auto divisor = mx::where(is_positive,
+                             mx::array(penalty, vals.dtype()),
+                             mx::array(1.0f / penalty, vals.dtype()));
+    auto penalized = mx::divide(vals, divisor);  // [N]
+
+    // Step 5: Compute delta: penalized - original
+    auto delta = mx::subtract(penalized, vals);  // [N]
+
+    // Step 6: Use scatter_add to add deltas back to original logits
+    // scatter_add dimension requirement: updates.ndim = indices.ndim + a.ndim
+    // For 2D array [B*V, 1] and 1D indices [N]: updates must be 3D [N, 1, 1]
+    // updates[i] (shape [1,1]) gets added at a[idx[i], :] (shape [1])
+    auto logits_2d = mx::reshape(logits_flat, {B * vocab_size, 1});  // [B*V, 1]
+    auto delta_3d = mx::reshape(delta, {N, 1, 1});  // [N, 1, 1]
+
+    auto result_2d = mx::scatter_add(logits_2d, idx, delta_3d, 0);  // [B*V, 1]
+    auto result_flat = mx::squeeze(result_2d, 1);  // [B*V]
+
+    return mx::reshape(result_flat, {B, vocab_size});
 }
 
 // Helper: Apply top-p filtering in a vectorized manner
