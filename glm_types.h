@@ -144,7 +144,7 @@ struct GenerationConfig {
     bool do_sample = true;        // Match Python default (NOT greedy!)
     int top_k = 50;               // Relaxed from 2 to reduce repetition
     float top_p = 0.6f;           // Match Python default
-    float repetition_penalty = 1.0f;  // 1.0 = no penalty, >1.0 penalizes repetition
+    float repetition_penalty = 1.1f;  // 1.1 = optimal (breaks loops without hurting quality)
 };
 
 struct GridTHW {

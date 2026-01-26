@@ -897,16 +897,20 @@ mx::array sample_tokens_batched(
     int vocab_size = logits.shape(1);
     logits = mx::astype(logits, mx::float32);
 
-    // 2. Fast path: Greedy decoding (single op!)
+    // 2. Apply repetition penalty first (needed for both greedy and sampling)
+    if (config.repetition_penalty != 1.0f && !generated_tokens.empty()) {
+        logits = apply_repetition_penalty_batched(logits, generated_tokens, config.repetition_penalty);
+    }
+
+    // 3. Fast path: Greedy decoding (single op!)
     if (!config.do_sample) {
         auto tokens = mx::argmax(logits, -1);  // [B]
+        tokens = mx::astype(tokens, mx::int32);  // Ensure int32 for consistency
 
         // Handle finished sequences
         if (!finished.empty()) {
             std::vector<int32_t> eos_data(B, config.eos_token_ids[0]);
             auto eos_tokens = mx::array(eos_data.data(), {B}, mx::int32);
-            std::vector<bool> finished_vec(finished.begin(), finished.end());
-            // Convert bool vector to array
             std::vector<uint8_t> mask_data(B);
             for (int b = 0; b < B; ++b) mask_data[b] = finished[b] ? 1 : 0;
             auto mask = mx::array(mask_data.data(), {B}, mx::bool_);
@@ -917,12 +921,7 @@ mx::array sample_tokens_batched(
         return tokens;
     }
 
-    // 3. Apply repetition penalty (vectorized)
-    if (config.repetition_penalty != 1.0f && !generated_tokens.empty()) {
-        logits = apply_repetition_penalty_batched(logits, generated_tokens, config.repetition_penalty);
-    }
-
-    // 4. Temperature scaling
+    // 4. Temperature scaling (sampling path continues here)
     auto scores = mx::divide(logits, mx::array(config.temperature));
 
     // 5. Top-K filtering (vectorized)
@@ -2149,7 +2148,15 @@ int run_generate_mode(const std::string& weights_dir) {
         auto inputs_embeds = mx::concatenate({prefix_batched, batched_img_a, mid_batched, batched_img_b, suffix_batched}, 1);
 
         // Create batched position IDs for this chunk
-        auto chunk_input_ids = mx::broadcast_to(input_ids, {chunk_B, num_tokens});
+        // CRITICAL: MLX broadcast_to/tile create views that don't materialize correctly
+        // when copied to CPU and read via pointer. Must build from raw data.
+        std::vector<int32_t> batched_ids(chunk_B * num_tokens);
+        mx::eval(input_ids);
+        const int32_t* src_ids = input_ids.data<int32_t>();
+        for (int b = 0; b < chunk_B; ++b) {
+            std::memcpy(batched_ids.data() + b * num_tokens, src_ids, num_tokens * sizeof(int32_t));
+        }
+        auto chunk_input_ids = mx::array(batched_ids.data(), {chunk_B, num_tokens}, mx::int32);
 
         std::vector<GridTHW> grids;
         for (int i = 0; i < chunk_B; ++i) {
@@ -2404,7 +2411,15 @@ int run_describe_mode(const std::string& weights_dir) {
         auto inputs_embeds = mx::concatenate({prefix_batched, batched_img, suffix_batched}, 1);
 
         // Create batched position IDs for this chunk
-        auto chunk_input_ids = mx::broadcast_to(input_ids, {chunk_B, num_tokens});
+        // CRITICAL: MLX broadcast_to/tile create views that don't materialize correctly
+        // when copied to CPU and read via pointer. Must build from raw data.
+        std::vector<int32_t> batched_ids(chunk_B * num_tokens);
+        mx::eval(input_ids);
+        const int32_t* src_ids = input_ids.data<int32_t>();
+        for (int b = 0; b < chunk_B; ++b) {
+            std::memcpy(batched_ids.data() + b * num_tokens, src_ids, num_tokens * sizeof(int32_t));
+        }
+        auto chunk_input_ids = mx::array(batched_ids.data(), {chunk_B, num_tokens}, mx::int32);
 
         std::vector<GridTHW> grids;
         for (int i = 0; i < chunk_B; ++i) {

@@ -1,7 +1,7 @@
 # Makefile for GLM-4.6V MLX C++ implementation
 
 CXX = clang++
-CXXFLAGS = -std=c++17 -O3 -Wall
+CXXFLAGS = -std=c++17 -O3 -Wall -Wunused-function -ffunction-sections
 
 # MLX paths (homebrew installation)
 MLX_INCLUDE = -I/opt/homebrew/include
@@ -14,7 +14,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 TURBOJPEG = -lturbojpeg
 
 # Linker flags
-LDFLAGS = $(MLX_LIB) $(FRAMEWORKS) $(TURBOJPEG) -Wl,-rpath,/opt/homebrew/lib
+LDFLAGS = $(MLX_LIB) $(FRAMEWORKS) $(TURBOJPEG) -Wl,-rpath,/opt/homebrew/lib -Wl,-dead_strip -Wl,-map,dead_code_map.txt
 
 TARGET = glm46v_mlx
 SRC = glm46v_mlx.cpp
@@ -27,7 +27,7 @@ $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) $(MLX_INCLUDE) -o $@ $< $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) dead_code_map.txt
 
 bench: $(TARGET)
 	./$(TARGET)
