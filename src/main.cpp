@@ -2,25 +2,18 @@
 #include <mlx/ops.h>
 #include <mlx/fast.h>
 #include <vector>
-#include <cmath>
-#include <iostream>
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
-#include <optional>
 #include <string>
-#include <map>
-#include <iomanip>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <filesystem>
-#include <array>
 #include <functional>
-#include <turbojpeg.h>
 #include <cstring>
 #include "glm_types.h"
 #include "glm_image.h"
@@ -61,7 +54,7 @@ GenerationConfig parse_generation_config(int max_tokens) {
     const char* seed_env = std::getenv("GLM_SEED");
     if (seed_env) {
         mx::random::seed(static_cast<uint64_t>(std::atoll(seed_env)));
-        std::cout << "Random seed: " << seed_env << std::endl;
+        printf("Random seed: %s\n", seed_env);
     }
 
     return config;
@@ -69,11 +62,9 @@ GenerationConfig parse_generation_config(int max_tokens) {
 
 // Print generation config summary
 void print_generation_config(const GenerationConfig& config) {
-    std::cout << "\nSampling config: do_sample=" << (config.do_sample ? "true" : "false")
-              << " temp=" << config.temperature
-              << " top_k=" << config.top_k
-              << " top_p=" << config.top_p
-              << " rep_penalty=" << config.repetition_penalty << std::endl;
+    printf("\nSampling config: do_sample=%s temp=%.2f top_k=%d top_p=%.2f rep_penalty=%.2f\n",
+           config.do_sample ? "true" : "false", config.temperature,
+           config.top_k, config.top_p, config.repetition_penalty);
 }
 
 // Load filenames from text file
@@ -110,15 +101,15 @@ void print_token_analysis(const std::vector<int32_t>& tokens, bool include_think
     for (size_t j = 0; j < tokens.size(); ++j) {
         int32_t tok = tokens[j];
         if (tok == 151329) {
-            std::cout << "  [" << j << "] EOS" << std::endl;
+            printf("  [%zu] EOS\n", j);
         } else if (include_think_tags && tok == 151346) {
-            std::cout << "  [" << j << "] <think>" << std::endl;
+            printf("  [%zu] <think>\n", j);
         } else if (include_think_tags && tok == 151347) {
-            std::cout << "  [" << j << "] </think>" << std::endl;
+            printf("  [%zu] </think>\n", j);
         } else if (tok >= 65 && tok <= 90) {
-            std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
+            printf("  [%zu] '%c'\n", j, static_cast<char>(tok));
         } else if (tok >= 97 && tok <= 122) {
-            std::cout << "  [" << j << "] '" << static_cast<char>(tok) << "'" << std::endl;
+            printf("  [%zu] '%c'\n", j, static_cast<char>(tok));
         }
     }
 }
@@ -126,10 +117,8 @@ void print_token_analysis(const std::vector<int32_t>& tokens, bool include_think
 // Print generation timing summary
 void print_generation_timing(double ms, int total_tokens) {
     double tokens_per_sec = total_tokens / (ms / 1000.0);
-    std::cout << "\n=== Results ===" << std::endl;
-    std::cout << "Generated " << total_tokens << " total tokens in "
-              << std::fixed << std::setprecision(1) << ms << " ms"
-              << " (" << std::setprecision(1) << tokens_per_sec << " tok/s)" << std::endl;
+    printf("\n=== Results ===\nGenerated %d total tokens in %.1f ms (%.1f tok/s)\n",
+           total_tokens, ms, tokens_per_sec);
 }
 
 // Precompute Embeddings: JPEG -> Vision Encoder -> Save to Disk
@@ -138,12 +127,12 @@ int run_precompute_embeddings(const std::string& input_dir,
                                const std::string& output_dir,
                                const std::string& weights_dir,
                                int batch_size) {
-    std::cout << "=== Precompute Vision Embeddings ===" << std::endl;
-    std::cout << "Input:  " << input_dir << std::endl;
-    std::cout << "Output: " << output_dir << std::endl;
-    std::cout << "Config: " << g_img_cfg.image_size << "x" << g_img_cfg.image_size
-              << " -> " << g_img_cfg.tokens_per_image << " tokens per image" << std::endl;
-    std::cout << "Batch:  " << batch_size << std::endl;
+    puts("=== Precompute Vision Embeddings ===");
+    printf("Input:  %s\n", input_dir.c_str());
+    printf("Output: %s\n", output_dir.c_str());
+    printf("Config: %dx%d -> %d tokens per image\n",
+           g_img_cfg.image_size, g_img_cfg.image_size, g_img_cfg.tokens_per_image);
+    printf("Batch:  %d\n", batch_size);
 
     fs::create_directories(output_dir);
 
@@ -151,20 +140,20 @@ int run_precompute_embeddings(const std::string& input_dir,
     try {
         image_files = list_images_recursive(input_dir);
     } catch (const std::exception& e) {
-        std::cerr << "Error listing images: " << e.what() << std::endl;
+        fprintf(stderr, "Error listing images: %s\n", e.what());
         return 1;
     }
 
     if (image_files.empty()) {
-        std::cerr << "No images found in " << input_dir << std::endl;
+        fprintf(stderr, "No images found in %s\n", input_dir.c_str());
         return 1;
     }
-    std::cout << "Found " << image_files.size() << " images\n" << std::endl;
+    printf("Found %zu images\n\n", image_files.size());
 
-    std::cout << "Loading vision encoder..." << std::endl;
+    puts("Loading vision encoder...");
     VisionWeights vision;
     if (!load_vision_weights(&vision, weights_dir + "/vision_encoder.bin")) {
-        std::cerr << "Failed to load vision weights" << std::endl;
+        fputs("Failed to load vision weights\n", stderr);
         return 1;
     }
 
@@ -190,7 +179,7 @@ int run_precompute_embeddings(const std::string& input_dir,
     std::ofstream names_out(filenames_path);
 
     if (!emb_out || !names_out) {
-        std::cerr << "Failed to open output files" << std::endl;
+        fputs("Failed to open output files\n", stderr);
         return 1;
     }
 
@@ -329,9 +318,8 @@ int run_precompute_embeddings(const std::string& input_dir,
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start_time).count();
         double rate = images_processed.load() / elapsed;
-        std::cout << "\r  Processed " << images_processed.load() << "/" << total_images
-                  << " images (" << std::fixed << std::setprecision(1) << rate << " img/s)"
-                  << std::flush;
+        printf("\r  Processed %d/%zu images (%.1f img/s)", images_processed.load(), total_images, rate);
+        fflush(stdout);
 
         {
             std::lock_guard<std::mutex> lock(mu);
@@ -354,7 +342,7 @@ int run_precompute_embeddings(const std::string& input_dir,
     loader_thread.join();
 
     if (!error.empty()) {
-        std::cerr << "\nError: " << error << std::endl;
+        fprintf(stderr, "\nError: %s\n", error.c_str());
         return 1;
     }
 
@@ -364,13 +352,13 @@ int run_precompute_embeddings(const std::string& input_dir,
     auto end_time = std::chrono::steady_clock::now();
     double total_time = std::chrono::duration<double>(end_time - start_time).count();
 
-    std::cout << "\n\n=== Complete ===" << std::endl;
-    std::cout << "Processed: " << images_processed.load() << " images" << std::endl;
-    std::cout << "Time:      " << std::fixed << std::setprecision(2) << total_time << " seconds" << std::endl;
-    std::cout << "Rate:      " << std::setprecision(1) << (images_processed.load() / total_time) << " images/sec" << std::endl;
-    std::cout << "Output:" << std::endl;
-    std::cout << "  " << embeddings_path << " (" << (fs::file_size(embeddings_path) / 1024 / 1024) << " MB)" << std::endl;
-    std::cout << "  " << filenames_path << std::endl;
+    printf("\n\n=== Complete ===\n");
+    printf("Processed: %d images\n", images_processed.load());
+    printf("Time:      %.2f seconds\n", total_time);
+    printf("Rate:      %.1f images/sec\n", images_processed.load() / total_time);
+    printf("Output:\n  %s (%zu MB)\n  %s\n",
+           embeddings_path.c_str(), fs::file_size(embeddings_path) / 1024 / 1024,
+           filenames_path.c_str());
 
     return 0;
 }
@@ -396,22 +384,22 @@ int run_generate_mode(const std::string& weights_dir) {
         if (chunk_size <= 0) chunk_size = batch_size;
     }
 
-    std::cout << "=== Dual-Image Comparison Generation (448x448) ===" << std::endl;
+    puts("=== Dual-Image Comparison Generation (448x448) ===");
     if (chunk_size < batch_size) {
-        std::cout << "Chunk size: " << chunk_size << " (processing in chunks)" << std::endl;
+        printf("Chunk size: %d (processing in chunks)\n", chunk_size);
     }
 
     std::string filenames_path = embeds_dir + "/filenames.txt";
     auto filenames = load_filenames(filenames_path);
     if (filenames.empty()) {
-        std::cerr << "Failed to open " << filenames_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", filenames_path.c_str());
         return 1;
     }
     int num_images = static_cast<int>(filenames.size());
-    std::cout << "Loaded " << num_images << " image filenames" << std::endl;
+    printf("Loaded %d image filenames\n", num_images);
 
     if (num_images < 2) {
-        std::cerr << "Need at least 2 images for comparison" << std::endl;
+        fputs("Need at least 2 images for comparison\n", stderr);
         return 1;
     }
 
@@ -421,7 +409,7 @@ int run_generate_mode(const std::string& weights_dir) {
         int max_pairs = batch_size_env ? std::atoi(batch_size_env) : 64;
         std::ifstream pairs_file(pairs_file_env);
         if (!pairs_file) {
-            std::cerr << "Failed to open pairs file: " << pairs_file_env << std::endl;
+            fprintf(stderr, "Failed to open pairs file: %s\n", pairs_file_env);
             return 1;
         }
         std::string pair_line;
@@ -436,16 +424,16 @@ int run_generate_mode(const std::string& weights_dir) {
             }
         }
         pairs_file.close();
-        std::cout << "Loaded " << pairs.size() << " pairs from " << pairs_file_env << std::endl;
+        printf("Loaded %zu pairs from %s\n", pairs.size(), pairs_file_env);
     } else if (idx_a_env && idx_b_env) {
         int idx_a = std::atoi(idx_a_env);
         int idx_b = std::atoi(idx_b_env);
         if (idx_a >= 0 && idx_a < num_images && idx_b >= 0 && idx_b < num_images) {
             pairs.push_back({idx_a, idx_b});
-            std::cout << "Using explicit pair: A=" << idx_a << ", B=" << idx_b << std::endl;
+            printf("Using explicit pair: A=%d, B=%d\n", idx_a, idx_b);
         } else {
-            std::cerr << "Invalid indices: idx_a=" << idx_a << ", idx_b=" << idx_b
-                      << " (num_images=" << num_images << ")" << std::endl;
+            fprintf(stderr, "Invalid indices: idx_a=%d, idx_b=%d (num_images=%d)\n",
+                    idx_a, idx_b, num_images);
             return 1;
         }
     } else {
@@ -456,25 +444,26 @@ int run_generate_mode(const std::string& weights_dir) {
             do { idx_b = std::rand() % num_images; } while (idx_b == idx_a);
             pairs.push_back({idx_a, idx_b});
         }
-        std::cout << "Generated " << pairs.size() << " random pairs" << std::endl;
+        printf("Generated %zu random pairs\n", pairs.size());
     }
 
     int B = static_cast<int>(pairs.size());
     if (B == 0) {
-        std::cerr << "No valid pairs to process" << std::endl;
+        fputs("No valid pairs to process\n", stderr);
         return 1;
     }
 
-    std::cout << "\nComparing " << B << " pair" << (B > 1 ? "s" : "") << ":" << std::endl;
+    printf("\nComparing %d pair%s:\n", B, B > 1 ? "s" : "");
     for (int i = 0; i < B; ++i) {
-        std::cout << "  [" << i << "] A=" << pairs[i].first << " (" << filenames[pairs[i].first] << ")"
-                  << " vs B=" << pairs[i].second << " (" << filenames[pairs[i].second] << ")" << std::endl;
+        printf("  [%d] A=%d (%s) vs B=%d (%s)\n", i,
+               pairs[i].first, filenames[pairs[i].first].c_str(),
+               pairs[i].second, filenames[pairs[i].second].c_str());
     }
 
     std::string embeds_path = embeds_dir + "/embeddings.bin";
     std::ifstream embeds_file(embeds_path, std::ios::binary);
     if (!embeds_file) {
-        std::cerr << "Failed to open " << embeds_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", embeds_path.c_str());
         return 1;
     }
 
@@ -495,16 +484,16 @@ int run_generate_mode(const std::string& weights_dir) {
     std::string tokens_path = weights_dir + "/dueling_prompt_tokens_448.bin";
     auto prompt_tokens = load_prompt_tokens(tokens_path);
     if (prompt_tokens.empty()) {
-        std::cerr << "Failed to open " << tokens_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", tokens_path.c_str());
         return 1;
     }
     int num_tokens = static_cast<int>(prompt_tokens.size());
-    std::cout << "Loaded " << num_tokens << " prompt tokens" << std::endl;
+    printf("Loaded %d prompt tokens\n", num_tokens);
 
-    std::cout << "Loading text model..." << std::endl;
+    puts("Loading text model...");
     TextModelWeights text;
     if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-        std::cerr << "Failed to load text weights" << std::endl;
+        fputs("Failed to load text weights\n", stderr);
         return 1;
     }
 
@@ -519,11 +508,11 @@ int run_generate_mode(const std::string& weights_dir) {
     print_generation_config(config);
 
     int num_chunks = (B + chunk_size - 1) / chunk_size;
-    std::cout << "\nGenerating up to " << max_tokens << " tokens for " << B << " pair" << (B > 1 ? "s" : "");
+    printf("\nGenerating up to %d tokens for %d pair%s", max_tokens, B, B > 1 ? "s" : "");
     if (num_chunks > 1) {
-        std::cout << " in " << num_chunks << " chunks of " << chunk_size;
+        printf(" in %d chunks of %d", num_chunks, chunk_size);
     }
-    std::cout << "..." << std::endl;
+    puts("...");
 
     std::vector<std::vector<int32_t>> all_generated;
     all_generated.reserve(B);
@@ -536,8 +525,8 @@ int run_generate_mode(const std::string& weights_dir) {
         int chunk_B = chunk_end - chunk_start;
 
         if (num_chunks > 1) {
-            std::cout << "\n--- Chunk " << (chunk_idx + 1) << "/" << num_chunks
-                      << " (pairs " << chunk_start << "-" << (chunk_end - 1) << ") ---" << std::endl;
+            printf("\n--- Chunk %d/%d (pairs %d-%d) ---\n",
+                   chunk_idx + 1, num_chunks, chunk_start, chunk_end - 1);
         }
 
         std::vector<uint16_t> img_a_data(chunk_B * tokens_per_image * TEXT_DIM);
@@ -587,7 +576,7 @@ int run_generate_mode(const std::string& weights_dir) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 chunk_tokens += all_generated[i].size();
             }
-            std::cout << "Chunk generated " << chunk_tokens << " tokens" << std::endl;
+            printf("Chunk generated %d tokens\n", chunk_tokens);
         }
     }
 
@@ -602,14 +591,12 @@ int run_generate_mode(const std::string& weights_dir) {
     print_generation_timing(ms, total_tokens);
 
     for (int i = 0; i < B; ++i) {
-        std::cout << "\n--- Pair " << i << " (A=" << pairs[i].first << " vs B=" << pairs[i].second << ") ---" << std::endl;
-        std::cout << "Generated " << all_generated[i].size() << " tokens" << std::endl;
-        std::cout << "Token IDs: ";
+        printf("\n--- Pair %d (A=%d vs B=%d) ---\n", i, pairs[i].first, pairs[i].second);
+        printf("Generated %zu tokens\nToken IDs:", all_generated[i].size());
         for (size_t j = 0; j < all_generated[i].size(); ++j) {
-            std::cout << all_generated[i][j];
-            if (j < all_generated[i].size() - 1) std::cout << " ";
+            printf(" %d", all_generated[i][j]);
         }
-        std::cout << std::endl;
+        putchar('\n');
 
         print_token_analysis(all_generated[i], true);
     }
@@ -639,23 +626,23 @@ int run_describe_mode(const std::string& weights_dir) {
         if (chunk_size <= 0) chunk_size = batch_size;
     }
 
-    std::cout << "=== Image Description Mode (448x448) ===" << std::endl;
-    std::cout << "Batch size: " << batch_size << std::endl;
+    puts("=== Image Description Mode (448x448) ===");
+    printf("Batch size: %d\n", batch_size);
     if (chunk_size < batch_size) {
-        std::cout << "Chunk size: " << chunk_size << " (processing in chunks)" << std::endl;
+        printf("Chunk size: %d (processing in chunks)\n", chunk_size);
     }
 
     std::string filenames_path = embeds_dir + "/filenames.txt";
     auto filenames = load_filenames(filenames_path);
     if (filenames.empty()) {
-        std::cerr << "Failed to open " << filenames_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", filenames_path.c_str());
         return 1;
     }
     int num_images = static_cast<int>(filenames.size());
-    std::cout << "Loaded " << num_images << " image filenames" << std::endl;
+    printf("Loaded %d image filenames\n", num_images);
 
     if (num_images == 0) {
-        std::cerr << "No images found in embeddings directory" << std::endl;
+        fputs("No images found in embeddings directory\n", stderr);
         return 1;
     }
 
@@ -663,7 +650,7 @@ int run_describe_mode(const std::string& weights_dir) {
     if (indices_file_env) {
         std::ifstream indices_file(indices_file_env);
         if (!indices_file) {
-            std::cerr << "Failed to open indices file: " << indices_file_env << std::endl;
+            fprintf(stderr, "Failed to open indices file: %s\n", indices_file_env);
             return 1;
         }
         std::string idx_line;
@@ -676,14 +663,14 @@ int run_describe_mode(const std::string& weights_dir) {
             }
         }
         indices_file.close();
-        std::cout << "Loaded " << indices.size() << " indices from " << indices_file_env << std::endl;
+        printf("Loaded %zu indices from %s\n", indices.size(), indices_file_env);
     } else if (idx_env) {
         int idx = std::atoi(idx_env);
         if (idx >= 0 && idx < num_images) {
             indices.push_back(idx);
-            std::cout << "Using single image index: " << idx << std::endl;
+            printf("Using single image index: %d\n", idx);
         } else {
-            std::cerr << "GLM_IDX=" << idx << " is out of range [0, " << num_images - 1 << "]" << std::endl;
+            fprintf(stderr, "GLM_IDX=%d is out of range [0, %d]\n", idx, num_images - 1);
             return 1;
         }
     } else if (random_indices) {
@@ -691,31 +678,31 @@ int run_describe_mode(const std::string& weights_dir) {
         for (int i = 0; i < batch_size && i < num_images; ++i) {
             indices.push_back(std::rand() % num_images);
         }
-        std::cout << "Generated " << indices.size() << " random indices" << std::endl;
+        printf("Generated %zu random indices\n", indices.size());
     } else {
         for (int i = 0; i < batch_size && i < num_images; ++i) {
             indices.push_back(i);
         }
-        std::cout << "Using first " << indices.size() << " images" << std::endl;
+        printf("Using first %zu images\n", indices.size());
     }
 
     int B = static_cast<int>(indices.size());
     if (B == 0) {
-        std::cerr << "No valid indices to process" << std::endl;
+        fputs("No valid indices to process\n", stderr);
         return 1;
     }
-    std::cout << "\nProcessing " << B << " images:" << std::endl;
+    printf("\nProcessing %d images:\n", B);
     for (int i = 0; i < std::min(B, 10); ++i) {
-        std::cout << "  [" << i << "] idx=" << indices[i] << " (" << filenames[indices[i]] << ")" << std::endl;
+        printf("  [%d] idx=%d (%s)\n", i, indices[i], filenames[indices[i]].c_str());
     }
     if (B > 10) {
-        std::cout << "  ... and " << (B - 10) << " more" << std::endl;
+        printf("  ... and %d more\n", B - 10);
     }
 
     std::string embeds_path = embeds_dir + "/embeddings.bin";
     std::ifstream embeds_file(embeds_path, std::ios::binary);
     if (!embeds_file) {
-        std::cerr << "Failed to open " << embeds_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", embeds_path.c_str());
         return 1;
     }
 
@@ -729,21 +716,21 @@ int run_describe_mode(const std::string& weights_dir) {
         embeds_file.read(reinterpret_cast<char*>(embeds[i].data()), bytes_per_image);
     }
     embeds_file.close();
-    std::cout << "Loaded embeddings for " << B << " images" << std::endl;
+    printf("Loaded embeddings for %d images\n", B);
 
     std::string tokens_path = weights_dir + "/single_image_prompt_448.bin";
     auto prompt_tokens = load_prompt_tokens(tokens_path);
     if (prompt_tokens.empty()) {
-        std::cerr << "Failed to open " << tokens_path << std::endl;
+        fprintf(stderr, "Failed to open %s\n", tokens_path.c_str());
         return 1;
     }
     int num_tokens = static_cast<int>(prompt_tokens.size());
-    std::cout << "Loaded " << num_tokens << " prompt tokens (single-image)" << std::endl;
+    printf("Loaded %d prompt tokens (single-image)\n", num_tokens);
 
-    std::cout << "Loading text model..." << std::endl;
+    puts("Loading text model...");
     TextModelWeights text;
     if (!load_text_weights(&text, weights_dir + "/text_model.bin")) {
-        std::cerr << "Failed to load text weights" << std::endl;
+        fputs("Failed to load text weights\n", stderr);
         return 1;
     }
 
@@ -760,11 +747,11 @@ int run_describe_mode(const std::string& weights_dir) {
     print_generation_config(config);
 
     int num_chunks = (B + chunk_size - 1) / chunk_size;
-    std::cout << "\nGenerating up to " << max_tokens << " tokens for " << B << " images";
+    printf("\nGenerating up to %d tokens for %d images", max_tokens, B);
     if (num_chunks > 1) {
-        std::cout << " in " << num_chunks << " chunks of " << chunk_size;
+        printf(" in %d chunks of %d", num_chunks, chunk_size);
     }
-    std::cout << "..." << std::endl;
+    puts("...");
 
     std::vector<std::vector<int32_t>> all_generated;
     all_generated.reserve(B);
@@ -777,8 +764,8 @@ int run_describe_mode(const std::string& weights_dir) {
         int chunk_B = chunk_end - chunk_start;
 
         if (num_chunks > 1) {
-            std::cout << "\n--- Chunk " << (chunk_idx + 1) << "/" << num_chunks
-                      << " (images " << chunk_start << "-" << (chunk_end - 1) << ") ---" << std::endl;
+            printf("\n--- Chunk %d/%d (images %d-%d) ---\n",
+                   chunk_idx + 1, num_chunks, chunk_start, chunk_end - 1);
         }
 
         std::vector<uint16_t> img_data(chunk_B * tokens_per_image * TEXT_DIM);
@@ -821,7 +808,7 @@ int run_describe_mode(const std::string& weights_dir) {
             for (int i = chunk_start; i < chunk_end; ++i) {
                 chunk_tokens += all_generated[i].size();
             }
-            std::cout << "Chunk generated " << chunk_tokens << " tokens" << std::endl;
+            printf("Chunk generated %d tokens\n", chunk_tokens);
         }
     }
 
@@ -836,14 +823,12 @@ int run_describe_mode(const std::string& weights_dir) {
     print_generation_timing(ms, total_tokens);
 
     for (int i = 0; i < B; ++i) {
-        std::cout << "\n--- Image " << i << " (idx=" << indices[i] << ": " << filenames[indices[i]] << ") ---" << std::endl;
-        std::cout << "Generated " << all_generated[i].size() << " tokens" << std::endl;
-        std::cout << "Token IDs: ";
+        printf("\n--- Image %d (idx=%d: %s) ---\n", i, indices[i], filenames[indices[i]].c_str());
+        printf("Generated %zu tokens\nToken IDs:", all_generated[i].size());
         for (size_t j = 0; j < all_generated[i].size(); ++j) {
-            std::cout << all_generated[i][j];
-            if (j < all_generated[i].size() - 1) std::cout << " ";
+            printf(" %d", all_generated[i][j]);
         }
-        std::cout << std::endl;
+        putchar('\n');
 
         print_token_analysis(all_generated[i], false);
     }
@@ -904,7 +889,7 @@ int main(int argc, char* argv[]) {
         mx::set_default_device(gpu);
     } else {
         mx::set_default_device(mx::Device(mx::Device::cpu, 0));
-        std::cout << "GPU not available; using CPU." << std::endl;
+        puts("GPU not available; using CPU.");
     }
 
     mx::enable_compile();
@@ -915,7 +900,7 @@ int main(int argc, char* argv[]) {
     const char* image_size_env = std::getenv("GLM_IMAGE_SIZE");
     int image_size = image_size_env ? std::atoi(image_size_env) : 448;
     g_img_cfg = ImageConfig::from_size(image_size);
-    std::cout << "Image configuration:" << std::endl;
+    puts("Image configuration:");
     g_img_cfg.print();
 
     const char* precompute_env = std::getenv("GLM_PRECOMPUTE");

@@ -2,7 +2,7 @@
 
 #include <mlx/mlx.h>
 #include <vector>
-#include <iostream>
+#include <cstdio>
 
 namespace mx = mlx::core;
 
@@ -91,13 +91,11 @@ struct ImageConfig {
     }
 
     void print() const {
-        std::cout << "ImageConfig: size=" << image_size
-                  << " grid=" << grid
-                  << " tokens=" << tokens_per_image
-                  << " patch_dim=" << patch_dim << std::endl;
-        std::cout << "  Single: start=" << image_start << " end=" << image_end << std::endl;
-        std::cout << "  Dual: A=[" << image_a_start << "," << image_a_end << ")"
-                  << " B=[" << image_b_start << "," << image_b_end << ")" << std::endl;
+        printf("ImageConfig: size=%d grid=%d tokens=%d patch_dim=%d\n",
+               image_size, grid, tokens_per_image, patch_dim);
+        printf("  Single: start=%d end=%d\n", image_start, image_end);
+        printf("  Dual: A=[%d,%d) B=[%d,%d)\n",
+               image_a_start, image_a_end, image_b_start, image_b_end);
     }
 };
 

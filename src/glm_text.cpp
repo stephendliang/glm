@@ -1,6 +1,6 @@
 #include "glm_models.h"
 #include <fstream>
-#include <iostream>
+#include <cstdio>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -11,11 +11,11 @@ constexpr int REP_PENALTY_WINDOW = 64;
 // Text Weight Loading
 
 bool load_text_weights(TextModelWeights* model, const std::string& path) {
-    std::cout << "Loading text weights from: " << path << std::endl;
+    printf("Loading text weights from: %s\n", path.c_str());
 
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        std::cerr << "Error: Cannot open file: " << path << std::endl;
+        fprintf(stderr, "Error: Cannot open file: %s\n", path.c_str());
         return false;
     }
 
@@ -24,7 +24,7 @@ bool load_text_weights(TextModelWeights* model, const std::string& path) {
 
     std::vector<uint16_t> buffer(file_size / sizeof(uint16_t));
     if (!file.read(reinterpret_cast<char*>(buffer.data()), file_size)) {
-        std::cerr << "Error: Failed to read file: " << path << std::endl;
+        fprintf(stderr, "Error: Failed to read file: %s\n", path.c_str());
         return false;
     }
 
@@ -62,11 +62,11 @@ bool load_text_weights(TextModelWeights* model, const std::string& path) {
 
     size_t elements_read = ptr - buffer.data();
     if (elements_read != buffer.size()) {
-        std::cerr << "Warning: Read " << elements_read << " elements, buffer has " << buffer.size() << std::endl;
+        fprintf(stderr, "Warning: Read %zu elements, buffer has %zu\n", elements_read, buffer.size());
     }
 
-    std::cout << "Text weights loaded successfully!" << std::endl;
-    std::cout << "  File size: " << file_size / 1024 / 1024 << " MB (float16)" << std::endl;
+    puts("Text weights loaded successfully!");
+    printf("  File size: %zu MB (float16)\n", file_size / 1024 / 1024);
     return true;
 }
 
