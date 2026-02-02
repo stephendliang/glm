@@ -29,7 +29,7 @@ TURBOJPEG = -lturbojpeg
 LDFLAGS = $(MLX_LIB) $(FRAMEWORKS) $(TURBOJPEG) -Wl,-rpath,/opt/homebrew/lib -Wl,-dead_strip -Wl,-map,dead_code_map.txt
 
 TARGET = glm46v_mlx
-SRCS = glm46v_mlx.cpp glm_image.cpp glm_models.cpp glm_vision.cpp glm_text.cpp
+SRCS = main.cpp glm_image.cpp glm_models.cpp glm_vision.cpp glm_text.cpp
 OBJS = $(SRCS:%.cpp=$(BUILD_DIR)/%.o)
 
 .PHONY: all clean run verify verify-step bench bench-int8 bench-dueling verify-text verify-cpu export-weights test test-fp16 test-int8 export-int8 export-prompt precompute dueling analyze
