@@ -7,6 +7,7 @@
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -853,54 +854,48 @@ int run_describe_mode(const std::string& weights_dir) {
 // Print Usage Information
 
 void print_usage() {
-    std::cout << "GLM-4V MLX Inference Engine\n\n";
-    std::cout << "Usage: Set one of the following environment variables:\n\n";
-    std::cout << "Modes:\n";
-    std::cout << "  GLM_PRECOMPUTE=1         Precompute vision embeddings from images\n";
-    std::cout << "  GLM_GENERATE=1           Dual-image comparison (single or batched)\n";
-    std::cout << "  GLM_DESCRIBE=1           Single-image description (single or batched)\n\n";
-    std::cout << "GLM_GENERATE options:\n";
-    std::cout << "  GLM_IDX_A=N GLM_IDX_B=M  Single pair (both required for single mode)\n";
-    std::cout << "  GLM_PAIRS_FILE=path      Load pairs from file (idx_a,idx_b per line)\n";
-    std::cout << "  GLM_BATCH_SIZE=N         Number of random pairs (default: 4)\n";
-    std::cout << "  GLM_CHUNK_SIZE=N         Inference batch size (default: BATCH_SIZE)\n\n";
-    std::cout << "GLM_DESCRIBE options:\n";
-    std::cout << "  GLM_IDX=N                Single explicit image index\n";
-    std::cout << "  GLM_INDICES_FILE=path    Load indices from file (one per line)\n";
-    std::cout << "  GLM_RANDOM_INDICES=1     Use random indices instead of first N\n";
-    std::cout << "  GLM_BATCH_SIZE=N         Number of images to process (default: 64)\n";
-    std::cout << "  GLM_CHUNK_SIZE=N         Inference batch size (default: BATCH_SIZE)\n\n";
-    std::cout << "Common options:\n";
-    std::cout << "  GLM_IMAGE_SIZE=N         Image size in pixels (default: 448, also: 336)\n";
-    std::cout << "  GLM_WEIGHTS_DIR=path     Model weights directory (default: vision_weights)\n";
-    std::cout << "  GLM_EMBEDS_DIR=path      Embeddings directory (default: embeddings_out)\n";
-    std::cout << "  GLM_MAX_TOKENS=N         Max tokens to generate (default: 100)\n\n";
-    std::cout << "Sampling options:\n";
-    std::cout << "  GLM_DO_SAMPLE=1          Enable sampling (default: greedy)\n";
-    std::cout << "  GLM_TEMPERATURE=0.8      Temperature for sampling\n";
-    std::cout << "  GLM_TOP_K=50             Top-K sampling\n";
-    std::cout << "  GLM_TOP_P=0.9            Top-P (nucleus) sampling\n";
-    std::cout << "  GLM_REP_PENALTY=1.1      Repetition penalty\n";
-    std::cout << "  GLM_SEED=N               Random seed\n\n";
-    std::cout << "Examples:\n";
-    std::cout << "  # Precompute embeddings\n";
-    std::cout << "  GLM_PRECOMPUTE=1 GLM_INPUT_DIR=images GLM_OUTPUT_DIR=embeds ./glm46v_mlx\n\n";
-    std::cout << "  # Default: 4 random pairs\n";
-    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx\n\n";
-    std::cout << "  # Single explicit pair\n";
-    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_IDX_A=0 GLM_IDX_B=1 ./glm46v_mlx\n\n";
-    std::cout << "  # Custom batch size (8 random pairs)\n";
-    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_BATCH_SIZE=8 ./glm46v_mlx\n\n";
-    std::cout << "  # Load pairs from file\n";
-    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_PAIRS_FILE=pairs.txt ./glm46v_mlx\n\n";
-    std::cout << "  # Process 64 pairs in chunks of 8 (lower peak memory)\n";
-    std::cout << "  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_BATCH_SIZE=64 GLM_CHUNK_SIZE=8 ./glm46v_mlx\n\n";
-    std::cout << "  # Describe first 64 images\n";
-    std::cout << "  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx\n\n";
-    std::cout << "  # Describe single image by index\n";
-    std::cout << "  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds GLM_IDX=5 ./glm46v_mlx\n\n";
-    std::cout << "  # Process 512 images in chunks of 128 (lower peak memory)\n";
-    std::cout << "  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds GLM_BATCH_SIZE=512 GLM_CHUNK_SIZE=128 ./glm46v_mlx\n";
+    puts(R"(GLM-4V MLX Inference Engine
+
+Usage: Set one of the following environment variables:
+
+Modes:
+  GLM_PRECOMPUTE=1         Precompute vision embeddings from images
+  GLM_GENERATE=1           Dual-image comparison (single or batched)
+  GLM_DESCRIBE=1           Single-image description (single or batched)
+
+GLM_GENERATE options:
+  GLM_IDX_A=N GLM_IDX_B=M  Single pair (both required for single mode)
+  GLM_PAIRS_FILE=path      Load pairs from file (idx_a,idx_b per line)
+  GLM_BATCH_SIZE=N         Number of random pairs (default: 4)
+  GLM_CHUNK_SIZE=N         Inference batch size (default: BATCH_SIZE)
+
+GLM_DESCRIBE options:
+  GLM_IDX=N                Single explicit image index
+  GLM_INDICES_FILE=path    Load indices from file (one per line)
+  GLM_RANDOM_INDICES=1     Use random indices instead of first N
+  GLM_BATCH_SIZE=N         Number of images to process (default: 64)
+  GLM_CHUNK_SIZE=N         Inference batch size (default: BATCH_SIZE)
+
+Common options:
+  GLM_IMAGE_SIZE=N         Image size in pixels (default: 448, also: 336)
+  GLM_WEIGHTS_DIR=path     Model weights directory (default: vision_weights)
+  GLM_EMBEDS_DIR=path      Embeddings directory (default: embeddings_out)
+  GLM_MAX_TOKENS=N         Max tokens to generate (default: 100)
+
+Sampling options:
+  GLM_DO_SAMPLE=1          Enable sampling (default: greedy)
+  GLM_TEMPERATURE=0.8      Temperature for sampling
+  GLM_TOP_K=50             Top-K sampling
+  GLM_TOP_P=0.9            Top-P (nucleus) sampling
+  GLM_REP_PENALTY=1.1      Repetition penalty
+  GLM_SEED=N               Random seed
+
+Examples:
+  GLM_PRECOMPUTE=1 GLM_INPUT_DIR=images GLM_OUTPUT_DIR=embeds ./glm46v_mlx
+  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx
+  GLM_GENERATE=1 GLM_EMBEDS_DIR=embeds GLM_IDX_A=0 GLM_IDX_B=1 ./glm46v_mlx
+  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds ./glm46v_mlx
+  GLM_DESCRIBE=1 GLM_EMBEDS_DIR=embeds GLM_IDX=5 ./glm46v_mlx)");
 }
 
 int main(int argc, char* argv[]) {
