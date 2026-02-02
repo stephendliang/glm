@@ -1,10 +1,22 @@
 # Makefile for GLM-4.6V MLX C++ implementation
 
 CXX = clang++
-CXXFLAGS = -std=c++17 -O3 -Wall -Wunused-function -ffunction-sections
+CXXFLAGS = -std=c++17 -O3 -Wall -Wextra \
+           -Wunused-function \
+           -Wunused-variable \
+           -Wunused-parameter \
+           -Wunreachable-code \
+           -ffunction-sections \
+           -fdata-sections
+
+# Directory structure
+SRC_DIR = src
+INC_DIR = include
+BUILD_DIR = build
 
 # MLX paths (homebrew installation)
 MLX_INCLUDE = -I/opt/homebrew/include
+LOCAL_INCLUDE = -I$(INC_DIR)
 MLX_LIB = -L/opt/homebrew/lib -lmlx
 
 # macOS frameworks required by MLX
@@ -17,23 +29,27 @@ TURBOJPEG = -lturbojpeg
 LDFLAGS = $(MLX_LIB) $(FRAMEWORKS) $(TURBOJPEG) -Wl,-rpath,/opt/homebrew/lib -Wl,-dead_strip -Wl,-map,dead_code_map.txt
 
 TARGET = glm46v_mlx
-SRC = glm46v_mlx.cpp
+SRCS = glm46v_mlx.cpp glm_image.cpp glm_models.cpp glm_vision.cpp glm_text.cpp
+OBJS = $(SRCS:%.cpp=$(BUILD_DIR)/%.o)
 
-.PHONY: all clean run verify verify-step bench bench-text bench-int8 bench-dueling verify-text verify-cpu export-weights test test-fp16 test-int8 export-int8 export-prompt precompute dueling
+.PHONY: all clean run verify verify-step bench bench-int8 bench-dueling verify-text verify-cpu export-weights test test-fp16 test-int8 export-int8 export-prompt precompute dueling analyze
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) $(MLX_INCLUDE) -o $@ $< $(LDFLAGS)
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(MLX_INCLUDE) $(LOCAL_INCLUDE) -c -o $@ $<
+
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) dead_code_map.txt
+	rm -rf $(TARGET) $(BUILD_DIR) dead_code_map.txt
 
 bench: $(TARGET)
 	./$(TARGET)
-
-bench-text: $(TARGET)
-	GLM_RUN_TEXT=1 ./$(TARGET)
 
 verify: $(TARGET)
 	GLM_VERIFY=1 GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
@@ -109,3 +125,7 @@ batch-single: $(TARGET)
 	GLM_BATCH_SIZE=$(or $(BATCH),64) GLM_MAX_TOKENS=$(or $(TOKENS),100) \
 	$(if $(INDICES),GLM_INDICES_FILE=$(INDICES)) \
 	GLM_WEIGHTS_DIR=vision_weights ./$(TARGET)
+
+# Static analysis for unused functions
+analyze:
+	cppcheck --enable=unusedFunction $(SRC_DIR) $(INC_DIR)
