@@ -1,0 +1,29 @@
+# Compiled binaries
+glm46v_mlx
+*.o
+
+# Generated test data
+*.bin
+!vision_weights/*.bin
+
+# Embedding caches
+embeddings*/
+embed2/
+
+# Old test datasets
+q1566/
+
+# Test images (can be regenerated)
+test_images*/
+
+# Build artifacts
+build_warnings.txt
+dead_code_map.txt
+glm_out.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

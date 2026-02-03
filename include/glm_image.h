@@ -8,7 +8,6 @@
 namespace mx = mlx::core;
 
 // JPEG/Image loading
-std::vector<uint8_t> read_file_bytes(const std::string& path);
 bool decode_jpeg(tjhandle handle, const std::string& path,
                  int* out_w, int* out_h, std::vector<uint8_t>* pixels);
 

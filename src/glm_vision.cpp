@@ -4,6 +4,19 @@
 #include <cmath>
 #include <algorithm>
 
+// Internal helper functions (de facto static)
+
+static mx::array gelu_erf(mx::array x) {
+    const float inv_sqrt2 = 0.70710678118f;
+    auto erf_arg = mx::multiply(mx::array(inv_sqrt2), x);
+    auto one_plus = mx::add(mx::array(1.0f), mx::erf(erf_arg));
+    return mx::multiply(mx::multiply(mx::array(0.5f), x), one_plus);
+}
+
+static mx::array layer_norm(mx::array x, const LayerNormWeights* w, float eps = 1e-5f) {
+    return mx::fast::layer_norm(x, w->weight, w->bias, eps);
+}
+
 // Vision Weight Loading
 
 bool load_vision_weights(VisionWeights* model, const std::string& path) {
@@ -76,7 +89,7 @@ bool load_vision_weights(VisionWeights* model, const std::string& path) {
 
 // Vision RoPE Functions
 
-mx::array rotate_half_vision(mx::array x) {
+static mx::array rotate_half_vision(mx::array x) {
     int dim = x.shape(-1);
     int half = dim / 2;
     auto x1 = mx::slice(x, {0, 0, 0}, {x.shape(0), x.shape(1), half});
@@ -85,9 +98,9 @@ mx::array rotate_half_vision(mx::array x) {
     return mx::concatenate({neg_x2, x1}, 2);
 }
 
-std::pair<mx::array, mx::array> apply_rotary_pos_emb_vision(mx::array q, mx::array k,
-                                                            const mx::array& cos,
-                                                            const mx::array& sin) {
+static std::pair<mx::array, mx::array> apply_rotary_pos_emb_vision(mx::array q, mx::array k,
+                                                                   const mx::array& cos,
+                                                                   const mx::array& sin) {
     auto q_fp32 = mx::astype(q, mx::float32);
     auto k_fp32 = mx::astype(k, mx::float32);
     auto cos_exp = mx::reshape(cos, {cos.shape(0), 1, cos.shape(1)});
@@ -99,7 +112,7 @@ std::pair<mx::array, mx::array> apply_rotary_pos_emb_vision(mx::array q, mx::arr
     return {mx::astype(q_embed, q.dtype()), mx::astype(k_embed, k.dtype())};
 }
 
-VisionPositionData build_vision_position_data(const std::vector<GridTHW>& grid_thw) {
+static VisionPositionData build_vision_position_data(const std::vector<GridTHW>& grid_thw) {
     VisionPositionData data;
     std::vector<int> h_coords;
     std::vector<int> w_coords;
@@ -174,14 +187,14 @@ VisionPositionData build_vision_position_data(const std::vector<GridTHW>& grid_t
 
 // Vision Model Forward Functions
 
-mx::array vision_mlp_forward(mx::array x, const MLPWeights* w) {
+static mx::array vision_mlp_forward(mx::array x, const MLPWeights* w) {
     auto gate = silu(fast_linear(x, &w->gate_proj));
     auto up = fast_linear(x, &w->up_proj);
     return fast_linear(mx::multiply(gate, up), &w->down_proj);
 }
 
-mx::array vision_attention_forward(mx::array x, const VisionBlockWeights* w,
-                                   const VisionPositionData& pos) {
+static mx::array vision_attention_forward(mx::array x, const VisionBlockWeights* w,
+                                          const VisionPositionData& pos) {
     int total_seq = x.shape(0);
     auto qkv = fast_linear(x, &w->attn.qkv);
     auto qkv_rs = mx::reshape(qkv, {total_seq, 3, NUM_HEADS, HEAD_DIM});
@@ -222,8 +235,8 @@ mx::array vision_attention_forward(mx::array x, const VisionBlockWeights* w,
     return fast_linear(attn_out, &w->attn.proj);
 }
 
-mx::array vision_block_forward(mx::array x, const VisionBlockWeights* w,
-                               const VisionPositionData& pos) {
+static mx::array vision_block_forward(mx::array x, const VisionBlockWeights* w,
+                                      const VisionPositionData& pos) {
     auto residual = x;
     auto x_norm = rms_norm(x, &w->norm1, VISION_RMS_EPS);
     auto attn_out = vision_attention_forward(x_norm, w, pos);
@@ -235,7 +248,7 @@ mx::array vision_block_forward(mx::array x, const VisionBlockWeights* w,
     return mx::add(residual, mlp_out);
 }
 
-mx::array merger_forward(mx::array x, const MergerWeights* w) {
+static mx::array merger_forward(mx::array x, const MergerWeights* w) {
     x = fast_linear(x, &w->proj);
     x = layer_norm(x, &w->post_ln, VISION_RMS_EPS);
     x = gelu_erf(x);
@@ -244,7 +257,7 @@ mx::array merger_forward(mx::array x, const MergerWeights* w) {
     return fast_linear(mx::multiply(gate, up), &w->down_proj);
 }
 
-mx::array patch_embed_forward(mx::array patches, const VisionWeights* model) {
+static mx::array patch_embed_forward(mx::array patches, const VisionWeights* model) {
     int num_patches = patches.shape(0);
     auto x = mx::reshape(patches, {num_patches, TEMPORAL_PATCH, PATCH_SIZE, 3, PATCH_SIZE});
     x = mx::transpose(x, {0, 1, 2, 4, 3});
@@ -259,11 +272,11 @@ mx::array patch_embed_forward(mx::array patches, const VisionWeights* model) {
     return mx::reshape(x, {num_patches, VISION_DIM});
 }
 
-mx::array interpolate_position_embeddings(const mx::array& pos_embed_weight,
-                                          const mx::array& h_coords,
-                                          const mx::array& w_coords,
-                                          const mx::array& target_h,
-                                          const mx::array& target_w) {
+static mx::array interpolate_position_embeddings(const mx::array& pos_embed_weight,
+                                                 const mx::array& h_coords,
+                                                 const mx::array& w_coords,
+                                                 const mx::array& target_h,
+                                                 const mx::array& target_w) {
     int orig_size = 24;
     int hidden_size = pos_embed_weight.shape(1);
     auto pos_2d = mx::reshape(pos_embed_weight, {orig_size, orig_size, hidden_size});
@@ -328,8 +341,8 @@ mx::array interpolate_position_embeddings(const mx::array& pos_embed_weight,
     return mx::astype(result, pos_embed_weight.dtype());
 }
 
-mx::array vision_embeddings_forward(mx::array x, const VisionWeights* model,
-                                    const VisionPositionData& pos) {
+static mx::array vision_embeddings_forward(mx::array x, const VisionWeights* model,
+                                           const VisionPositionData& pos) {
     bool needs_interpolation = false;
     for (size_t i = 0; i < pos.seqlens.size(); ++i) {
         int seq = pos.seqlens[i];

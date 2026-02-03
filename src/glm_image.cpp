@@ -12,7 +12,7 @@ namespace fs = std::filesystem;
 constexpr float IMAGE_MEAN[3] = {0.48145466f, 0.4578275f, 0.40821073f};
 constexpr float IMAGE_STD[3] = {0.26862954f, 0.26130258f, 0.27577711f};
 
-std::vector<uint8_t> read_file_bytes(const std::string& path) {
+static std::vector<uint8_t> read_file_bytes(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         throw std::runtime_error("Failed to open file: " + path);

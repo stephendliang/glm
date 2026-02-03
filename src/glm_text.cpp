@@ -72,7 +72,7 @@ bool load_text_weights(TextModelWeights* model, const std::string& path) {
 
 // Text RoPE Functions
 
-mx::array rotate_half_llm(mx::array x) {
+static mx::array rotate_half_llm(mx::array x) {
     int B = x.shape(0);
     int H = x.shape(1);
     int T = x.shape(2);
@@ -90,8 +90,8 @@ mx::array rotate_half_llm(mx::array x) {
     return mx::reshape(stacked, {B, H, T, dim});
 }
 
-std::pair<mx::array, mx::array> text_rotary_embeddings(const mx::array& hidden_states,
-                                                       const mx::array& position_ids) {
+static std::pair<mx::array, mx::array> text_rotary_embeddings(const mx::array& hidden_states,
+                                                              const mx::array& position_ids) {
     int rotary_dim = TEXT_HEAD_DIM;
     auto inv_idx = mx::astype(mx::arange(0, rotary_dim, 2), mx::float32);
     auto inv_freq = mx::divide(
@@ -113,7 +113,7 @@ std::pair<mx::array, mx::array> text_rotary_embeddings(const mx::array& hidden_s
     return {mx::astype(cos, hidden_states.dtype()), mx::astype(sin, hidden_states.dtype())};
 }
 
-std::pair<mx::array, mx::array> apply_multimodal_rotary_pos_emb(
+static std::pair<mx::array, mx::array> apply_multimodal_rotary_pos_emb(
     mx::array q, mx::array k, const mx::array& cos, const mx::array& sin) {
     std::vector<int> chunk_sizes = {
         MROPE_SECTION_0, MROPE_SECTION_1, MROPE_SECTION_2,
@@ -173,7 +173,7 @@ std::pair<mx::array, mx::array> apply_multimodal_rotary_pos_emb(
 
 // Text Model Forward Functions
 
-mx::array text_attention_forward_cached(
+static mx::array text_attention_forward_cached(
     mx::array x,
     const TextAttentionWeights* w,
     const std::pair<mx::array, mx::array>& position_embeddings,
@@ -217,7 +217,7 @@ mx::array text_attention_forward_cached(
     return fast_linear(out, &w->o_proj);
 }
 
-mx::array text_mlp_forward(mx::array x, const TextMLPWeights* w) {
+static mx::array text_mlp_forward(mx::array x, const TextMLPWeights* w) {
     auto gate_up = fast_linear(x, &w->gate_up_proj);
     auto gate_up_split = mx::split(gate_up, 2, 2);
     auto gate = silu(gate_up_split[0]);
@@ -225,7 +225,7 @@ mx::array text_mlp_forward(mx::array x, const TextMLPWeights* w) {
     return fast_linear(mx::multiply(gate, up), &w->down_proj);
 }
 
-mx::array text_layer_forward_cached(
+static mx::array text_layer_forward_cached(
     mx::array x,
     const TextLayerWeights* w,
     const std::pair<mx::array, mx::array>& position_embeddings,
@@ -246,13 +246,13 @@ mx::array text_layer_forward_cached(
     return mx::add(residual, x);
 }
 
-mx::array compute_logits(mx::array hidden_states, const TextModelWeights* model) {
+static mx::array compute_logits(mx::array hidden_states, const TextModelWeights* model) {
     return fast_linear(hidden_states, &model->lm_head);
 }
 
 // Sampling Functions
 
-mx::array apply_repetition_penalty_batched(
+static mx::array apply_repetition_penalty_batched(
     mx::array logits,
     const std::vector<std::vector<int32_t>>& generated_tokens,
     float penalty
@@ -303,7 +303,7 @@ mx::array apply_repetition_penalty_batched(
     return mx::reshape(result_flat, {B, vocab_size});
 }
 
-mx::array apply_top_p_batched(mx::array scores, float top_p) {
+static mx::array apply_top_p_batched(mx::array scores, float top_p) {
     int B = scores.shape(0);
     int vocab_size = scores.shape(1);
 
@@ -347,7 +347,7 @@ mx::array apply_top_p_batched(mx::array scores, float top_p) {
     return mx::reshape(result_flat, {B, vocab_size});
 }
 
-mx::array sample_tokens_batched(
+static mx::array sample_tokens_batched(
     mx::array logits,
     const GenerationConfig& config,
     const std::vector<std::vector<int32_t>>& generated_tokens,
@@ -423,13 +423,13 @@ mx::array sample_tokens_batched(
 
 // Batched Generation Functions
 
-mx::array make_default_position_ids(int B, int T) {
+static mx::array make_default_position_ids(int B, int T) {
     auto pos = mx::astype(mx::arange(T), mx::int32);
     pos = mx::reshape(pos, {1, 1, T});
     return mx::broadcast_to(pos, {3, B, T});
 }
 
-mx::array text_model_forward_embeds_batched(
+static mx::array text_model_forward_embeds_batched(
     mx::array inputs_embeds,
     const TextModelWeights* model,
     const mx::array& position_ids,
@@ -454,7 +454,7 @@ mx::array text_model_forward_embeds_batched(
     return rms_norm(x, &model->norm, TEXT_RMS_EPS);
 }
 
-bool is_eos_token(int32_t token, const GenerationConfig& config) {
+static bool is_eos_token(int32_t token, const GenerationConfig& config) {
     for (int eos_id : config.eos_token_ids) {
         if (token == eos_id) return true;
     }
